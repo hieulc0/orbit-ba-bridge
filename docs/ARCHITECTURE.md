@@ -15,9 +15,9 @@ Localhost WebSocket (`ws://127.0.0.1:48117`)
        │
 bridge-server (Rust CLI & runtime)
        │
-bridge-core (Driver abstractions, session management, routing)
+bridge-core (Driver abstractions, session management, routing, multi-actor conversations, SQLite store)
        │
-protocol (Wire types, versioned envelopes, validation)
+protocol (Wire types, versioned envelopes, domain identifiers, validation)
        │
 Orbit ACP (Future milestone)
 ```
@@ -29,6 +29,11 @@ Orbit ACP (Future milestone)
 3. **Local-Only Transport**: WebSocket listener binds to `127.0.0.1` by default. No remote access is exposed without explicit security layers.
 4. **Driver Boundary**: All browser interactions pass through the `BrowserDriver` trait, allowing `ExtensionDomDriver`, `MockBrowserDriver`, and future `HeadlessChromiumDriver` to share the same domain and routing logic.
 5. **No Repository Mutation by BA**: BA reasoning roles can challenge, analyze, and propose requirements, but have no direct repository write or command execution access.
+6. **Multi-Actor Independence**: `ActorRole` is strictly separated from `Participant` and `ParticipantSource`. A conversation supports multiple instances of the same role (e.g. `BA Product` and `BA Research`).
+7. **Authoritative Sender vs Browser Role**: ChatGPT Web natively exposes only `user` and `assistant`. Injected external turns (e.g. `Orbit SA`) submit through the user composer, but the bridge maintains the authoritative logical sender (`sa:orbit`) via an injection ledger rather than overwriting it as a human message.
+8. **Monotonic Message Sequence**: Every conversation enforces a strictly increasing monotonic sequence for message ordering.
+9. **Durable Discussion vs Model Context**: Full discussion history is persisted in SQLite, but each actor turn receives only a bounded projection (`ContextProjection`).
+10. **Structured Artifact Promotion**: Casual chat stays local to the bridge; only validated engineering artifacts (`RequirementBrief`, `TechnicalProposal`, `Challenge`, `Resolution`, `AcceptanceDecision`) are promoted to Orbit.
 
 ## Dual-Browser Architecture (Chromium & Firefox)
 
@@ -48,6 +53,13 @@ The browser extension is designed for seamless dual-browser execution across Chr
 
 ## Crate Responsibilities
 
-- **`crates/protocol`**: Stable wire format, `MessageEnvelope<T>`, `BrowserEvent`, `BrowserCommand`, identifiers (`SessionId`, `CorrelationId`, `TaskId`), and strict bounds validation.
-- **`crates/bridge-core`**: Trait `BrowserDriver`, `MockBrowserDriver`, `SessionManager` (lifecycle state machine and duplicate message filtering), and `BridgeRouter`.
+- **`crates/protocol`**: Stable wire format, `MessageEnvelope<T>`, `BrowserEvent`, `BrowserCommand`, domain identifiers (`SessionId`, `CorrelationId`, `TaskId`, `ConversationId`, `ParticipantId`, `MessageId`, `ArtifactId`), and bounds validation.
+- **`crates/bridge-core`**:
+  - `BrowserDriver` trait & `MockBrowserDriver`
+  - `SessionManager` & `BridgeRouter`
+  - Multi-actor model: `ActorRole`, `Participant`, `ParticipantSource`
+  - Discussion model: `Conversation`, `ConversationMessage`, `MessageKind`
+  - Injection ledger & external-to-logical sender reconciliation
+  - Artifact reference definitions & context projection
+  - `ConversationStore` trait and `SqliteConversationStore` implementation
 - **`crates/bridge-server`**: Executable CLI, configuration, `tokio-tungstenite` WebSocket listener on localhost, logging via `tracing`, and graceful shutdown handling.
