@@ -46,6 +46,12 @@ pub enum ProtocolError {
     #[error("artifact ID cannot be empty")]
     EmptyArtifactId,
 
+    #[error("injection ID cannot be empty")]
+    EmptyInjectionId,
+
+    #[error("invalid auth token")]
+    InvalidAuthToken,
+
     #[error("serialization error: {0}")]
     Serialization(String),
 }
@@ -288,6 +294,51 @@ impl fmt::Display for ArtifactId {
     }
 }
 
+/// Identifier for an outbound message injection turn.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InjectionId(pub String);
+
+impl InjectionId {
+    pub fn new(id: impl Into<String>) -> Result<Self, ProtocolError> {
+        let s = id.into();
+        if s.trim().is_empty() {
+            return Err(ProtocolError::EmptyInjectionId);
+        }
+        Ok(Self(s))
+    }
+
+    pub fn generate() -> Self {
+        Self(format!("inj-{}", uuid::Uuid::new_v4()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for InjectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Client handshake payload sent upon establishing a WebSocket connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHello {
+    pub protocol_version: u16,
+    pub token: String,
+    pub extension_version: String,
+}
+
+/// Server handshake response validating connection and session establishment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerHelloAck {
+    pub protocol_version: u16,
+    pub session_id: SessionId,
+    pub accepted: bool,
+}
+
 /// Supported external roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -299,29 +350,73 @@ pub enum ExternalRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum BrowserEvent {
+    Hello {
+        protocol_version: u16,
+        token: String,
+        extension_version: String,
+    },
     Connected,
-    PageReady,
-    ConversationDetected { conversation_id: Option<String> },
-    AssistantMessage { message_id: String, text: String },
-    UserMessage { message_id: String, text: String },
-    SessionUnavailable { reason: String },
+    PageReady {
+        #[serde(default)]
+        external_url: Option<String>,
+    },
+    ConversationDetected {
+        #[serde(default)]
+        conversation_id: Option<String>,
+        #[serde(default)]
+        external_conversation_ref: Option<String>,
+    },
+    UserMessageObserved {
+        external_message_id: String,
+        text: String,
+    },
+    AssistantMessageObserved {
+        external_message_id: String,
+        text: String,
+        #[serde(default)]
+        is_final: bool,
+    },
+    InjectionAccepted {
+        injection_id: InjectionId,
+    },
+    InjectionMaterialized {
+        injection_id: InjectionId,
+        external_message_id: String,
+    },
+    PageUnavailable {
+        reason: String,
+    },
+    Disconnected,
+    // Backward-compatibility aliases
+    AssistantMessage {
+        message_id: String,
+        text: String,
+    },
+    UserMessage {
+        message_id: String,
+        text: String,
+    },
+    SessionUnavailable {
+        reason: String,
+    },
 }
 
 impl BrowserEvent {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             BrowserEvent::AssistantMessage { text, .. }
-            | BrowserEvent::UserMessage { text, .. } => {
-                if text.len() > MAX_MESSAGE_TEXT_LENGTH {
-                    return Err(ProtocolError::TextTooLarge {
-                        actual: text.len(),
-                        max: MAX_MESSAGE_TEXT_LENGTH,
-                    });
-                }
+            | BrowserEvent::UserMessage { text, .. }
+            | BrowserEvent::AssistantMessageObserved { text, .. }
+            | BrowserEvent::UserMessageObserved { text, .. }
+                if text.len() > MAX_MESSAGE_TEXT_LENGTH =>
+            {
+                Err(ProtocolError::TextTooLarge {
+                    actual: text.len(),
+                    max: MAX_MESSAGE_TEXT_LENGTH,
+                })
             }
-            _ => {}
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -329,7 +424,18 @@ impl BrowserEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum BrowserCommand {
-    SendMessage { text: String },
+    HelloAck {
+        protocol_version: u16,
+        session_id: SessionId,
+    },
+    InjectMessage {
+        injection_id: InjectionId,
+        correlation_id: CorrelationId,
+        text: String,
+    },
+    SendMessage {
+        text: String,
+    },
     Ping,
     RequestPageState,
 }
@@ -337,17 +443,16 @@ pub enum BrowserCommand {
 impl BrowserCommand {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
-            BrowserCommand::SendMessage { text } => {
-                if text.len() > MAX_MESSAGE_TEXT_LENGTH {
-                    return Err(ProtocolError::TextTooLarge {
-                        actual: text.len(),
-                        max: MAX_MESSAGE_TEXT_LENGTH,
-                    });
-                }
+            BrowserCommand::SendMessage { text } | BrowserCommand::InjectMessage { text, .. }
+                if text.len() > MAX_MESSAGE_TEXT_LENGTH =>
+            {
+                Err(ProtocolError::TextTooLarge {
+                    actual: text.len(),
+                    max: MAX_MESSAGE_TEXT_LENGTH,
+                })
             }
-            _ => {}
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 

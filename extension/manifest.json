@@ -5,7 +5,8 @@
   "description": "Connects ChatGPT browser sessions to Orbit development workflows via a local WebSocket bridge.",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
   "host_permissions": [
     "https://chatgpt.com/*"
@@ -26,6 +27,16 @@
         "content/content.js"
       ],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "token.json"
+      ],
+      "matches": [
+        "https://chatgpt.com/*"
+      ]
     }
   ]
 }

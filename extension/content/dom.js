@@ -1,5 +1,8 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
+ *
+ * Implements debounced streaming assistant detection, duplicate suppression,
+ * and stable external message ID extraction.
  */
 
 (function () {
@@ -7,25 +10,35 @@
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
+      this.activeStreaming = new Map(); // id -> { text, timer }
       this.observer = null;
       this.currentConversationId = null;
+      this.pendingInjection = null;
+    }
+
+    setPendingInjection(injection) {
+      this.pendingInjection = injection;
     }
 
     start() {
       this.detectConversation();
-      this.scanExistingMessages();
+      this.scanMessages();
 
       this.observer = new MutationObserver(() => {
         this.detectConversation();
-        this.scanExistingMessages();
+        this.scanMessages();
       });
 
       this.observer.observe(document.body, {
         childList: true,
         subtree: true,
+        characterData: true,
       });
 
-      this.onEvent({ type: "page_ready" });
+      this.onEvent({
+        type: "page_ready",
+        payload: { external_url: window.location.href },
+      });
     }
 
     stop() {
@@ -33,6 +46,10 @@
         this.observer.disconnect();
         this.observer = null;
       }
+      for (const item of this.activeStreaming.values()) {
+        if (item.timer) clearTimeout(item.timer);
+      }
+      this.activeStreaming.clear();
     }
 
     detectConversation() {
@@ -42,17 +59,29 @@
         this.currentConversationId = convId;
         this.onEvent({
           type: "conversation_detected",
-          payload: { conversation_id: convId },
+          payload: {
+            conversation_id: convId,
+            external_conversation_ref: convId,
+          },
         });
       }
     }
 
-    scanExistingMessages() {
-      const messageElements = document.querySelectorAll(
+    isGenerating() {
+      return Boolean(
+        document.querySelector("button[data-testid='stop-button']") ||
+          document.querySelector("button[aria-label='Stop generating']") ||
+          document.querySelector("button[aria-label='Stop streaming']") ||
+          document.querySelector(".result-streaming")
+      );
+    }
+
+    scanMessages() {
+      const turns = document.querySelectorAll(
         "article, [data-message-author-role], [data-testid^='conversation-turn-']"
       );
 
-      messageElements.forEach((el, index) => {
+      turns.forEach((el, index) => {
         const role =
           el.getAttribute("data-message-author-role") ||
           (el.querySelector("[data-message-author-role='assistant']")
@@ -63,14 +92,10 @@
 
         if (!role) return;
 
-        const messageId =
+        const rawId =
           el.getAttribute("data-message-id") ||
           el.getAttribute("data-testid") ||
-          `msg-${index}-${el.textContent.slice(0, 24).trim()}`;
-
-        if (this.seenMessageIds.has(messageId)) {
-          return;
-        }
+          `turn-${index}`;
 
         const textEl =
           el.querySelector(".markdown") ||
@@ -80,18 +105,109 @@
 
         if (!text) return;
 
-        this.seenMessageIds.add(messageId);
+        if (role === "user") {
+          this.handleUserMessage(rawId, text);
+        } else if (role === "assistant") {
+          this.handleAssistantMessage(rawId, text, el);
+        }
+      });
+    }
 
-        const eventType =
-          role === "assistant" ? "assistant_message" : "user_message";
+    handleUserMessage(messageId, text) {
+      if (this.seenMessageIds.has(messageId)) {
+        return;
+      }
 
-        this.onEvent({
-          type: eventType,
-          payload: {
-            message_id: messageId,
-            text,
-          },
-        });
+      this.seenMessageIds.add(messageId);
+
+      // Check if this matches a pending external injection
+      if (this.pendingInjection) {
+        const inj = this.pendingInjection;
+        const snippet = inj.text.slice(0, 48);
+        if (text.includes(snippet) || (Date.now() - inj.timestamp < 10000)) {
+          this.onEvent({
+            type: "injection_materialized",
+            payload: {
+              injection_id: inj.injection_id,
+              external_message_id: messageId,
+            },
+          });
+          this.pendingInjection = null;
+        }
+      }
+
+      this.onEvent({
+        type: "user_message_observed",
+        payload: {
+          external_message_id: messageId,
+          text,
+        },
+      });
+    }
+
+    handleAssistantMessage(messageId, text, el) {
+      if (this.seenMessageIds.has(messageId)) {
+        return;
+      }
+
+      const isStreamingEl = el.classList.contains("result-streaming") ||
+        Boolean(el.querySelector(".result-streaming"));
+      const globallyGenerating = this.isGenerating();
+
+      if (isStreamingEl || globallyGenerating) {
+        // Debounce streaming: wait for generation to settle
+        if (this.activeStreaming.has(messageId)) {
+          const item = this.activeStreaming.get(messageId);
+          clearTimeout(item.timer);
+          item.text = text;
+          item.timer = setTimeout(() => {
+            this.finalizeAssistantMessage(messageId);
+          }, 800);
+        } else {
+          const timer = setTimeout(() => {
+            this.finalizeAssistantMessage(messageId);
+          }, 800);
+          this.activeStreaming.set(messageId, { text, timer });
+        }
+        return;
+      }
+
+      // If not streaming at all, finalize immediately
+      this.finalizeAssistantMessageWithText(messageId, text);
+    }
+
+    finalizeAssistantMessage(messageId) {
+      if (this.isGenerating()) {
+        // Still generating globally, reschedule
+        const item = this.activeStreaming.get(messageId);
+        if (item) {
+          clearTimeout(item.timer);
+          item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId), 600);
+        }
+        return;
+      }
+
+      const item = this.activeStreaming.get(messageId);
+      if (item) {
+        this.activeStreaming.delete(messageId);
+        this.finalizeAssistantMessageWithText(messageId, item.text);
+      }
+    }
+
+    finalizeAssistantMessageWithText(messageId, text) {
+      if (this.seenMessageIds.has(messageId)) {
+        return;
+      }
+
+      this.seenMessageIds.add(messageId);
+
+      this.onEvent({
+        type: "assistant_message_observed",
+        payload: {
+          external_message_id: messageId,
+          text,
+          is_final: true,
+        },
       });
     }
   }

@@ -19,7 +19,9 @@ pub use artifact::{ArtifactRef, ArtifactType};
 pub use context::{ContextProjection, ProjectedMessage};
 pub use conversation::{Conversation, ConversationStatus, NewConversation};
 pub use driver::{BrowserDriver, MockBrowserDriver};
-pub use injection::{InjectionLedger, PendingInjection, format_external_injection};
+pub use injection::{
+    InjectionLedger, MaterializedInjection, PendingInjection, format_external_injection,
+};
 pub use message::{ConversationMessage, MessageKind, NewMessage};
 pub use participant::{ActorRole, NewParticipant, Participant, ParticipantSource};
 pub use router::BridgeRouter;

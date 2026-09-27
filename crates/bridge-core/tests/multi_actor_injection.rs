@@ -2,7 +2,7 @@ use bridge_core::{
     ActorRole, ConversationStore, InjectionLedger, MessageKind, NewConversation, NewMessage,
     NewParticipant, ParticipantSource, SqliteConversationStore, format_external_injection,
 };
-use protocol::{CorrelationId, ParticipantId};
+use protocol::{CorrelationId, InjectionId, ParticipantId};
 
 #[tokio::test]
 async fn test_multi_actor_lifecycle_and_injection_ledger() {
@@ -69,7 +69,7 @@ async fn test_multi_actor_lifecycle_and_injection_ledger() {
     // -------------------------------------------------------------
     let human_text = "Let's design the dual-browser extension architecture.";
     let resolved_actor = ledger
-        .resolve_user_message(None, human_text)
+        .resolve_user_message(Some("dom-human-msg-1"), None, human_text)
         .unwrap_or_else(|| human.id.clone());
 
     assert_eq!(resolved_actor, human.id);
@@ -120,19 +120,37 @@ async fn test_multi_actor_lifecycle_and_injection_ledger() {
     let sa_content = "I propose separating provider selection from credential availability.";
     let formatted_prompt = format_external_injection("Orbit SA", sa_content);
     let sa_corr = CorrelationId::new("corr-sa-001").unwrap();
+    let sa_inj = InjectionId::new("inj-sa-001").unwrap();
 
-    // Record in injection ledger
-    ledger.record_injection(sa_corr.clone(), orbit_sa.id.clone(), &formatted_prompt);
+    // 1. Record injection in ledger
+    ledger.record_injection(
+        sa_inj.clone(),
+        sa_corr.clone(),
+        orbit_sa.id.clone(),
+        &formatted_prompt,
+    );
     assert_eq!(ledger.pending_count(), 1);
 
-    // ChatGPT DOM detects native user message matching the injected composer input
+    // 2. Extension acknowledges injection
+    assert!(ledger.mark_accepted(&sa_inj));
+
+    // 3. Extension materializes native user message from composer
+    let materialized_actor = ledger
+        .mark_materialized(&sa_inj, "dom-user-composer-msg-2")
+        .expect("Materialization should link injection to actor");
+    assert_eq!(materialized_actor, orbit_sa.id);
+    assert_eq!(ledger.pending_count(), 0);
+
+    // 4. Resolve observed message: Critical Invariant: Despite being a native user message in DOM, logical actor is Orbit SA!
     let resolved_sa_actor = ledger
-        .resolve_user_message(Some(&sa_corr), &formatted_prompt)
+        .resolve_user_message(
+            Some("dom-user-composer-msg-2"),
+            Some(&sa_corr),
+            &formatted_prompt,
+        )
         .expect("Injected message must resolve to the registered external actor");
 
-    // Critical Invariant: Despite being a native user message in DOM, logical actor is Orbit SA!
     assert_eq!(resolved_sa_actor, orbit_sa.id);
-    assert_eq!(ledger.pending_count(), 0);
 
     let msg_sa = store
         .append_message(NewMessage {
@@ -178,15 +196,23 @@ async fn test_multi_actor_lifecycle_and_injection_ledger() {
     // -------------------------------------------------------------
     let research_content = "External benchmark indicates Firefox MV3 background script difference.";
     let research_corr = CorrelationId::new("corr-res-002").unwrap();
+    let research_inj = InjectionId::new("inj-res-002").unwrap();
     let research_prompt = format_external_injection("BA Research", research_content);
 
     ledger.record_injection(
+        research_inj.clone(),
         research_corr.clone(),
         ba_research.id.clone(),
         &research_prompt,
     );
+    ledger.mark_materialized(&research_inj, "dom-user-composer-msg-3");
+
     let resolved_research_actor = ledger
-        .resolve_user_message(Some(&research_corr), &research_prompt)
+        .resolve_user_message(
+            Some("dom-user-composer-msg-3"),
+            Some(&research_corr),
+            &research_prompt,
+        )
         .unwrap();
 
     assert_eq!(resolved_research_actor, ba_research.id);

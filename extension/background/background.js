@@ -8,39 +8,100 @@ try {
   console.error("[OrbitBridge] Failed to importScripts in background worker:", e);
 }
 
-const { browserAPI, DEFAULT_WS_URL, createEnvelope } = globalThis.OrbitBridge;
+const { browserAPI, PROTOCOL_VERSION, EXTENSION_VERSION, DEFAULT_WS_URL, createEnvelope } =
+  globalThis.OrbitBridge;
 
 const SESSION_ID = `ext-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 let ws = null;
+let isAuthenticated = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 10000;
+let cachedAuthToken = null;
 
-function connectWebSocket() {
+async function loadAuthToken() {
+  if (cachedAuthToken) return cachedAuthToken;
+
+  // 1. Try chrome.storage.local
+  try {
+    const stored = await browserAPI.storage.local.get("authToken");
+    if (stored && stored.authToken) {
+      cachedAuthToken = stored.authToken;
+      return cachedAuthToken;
+    }
+  } catch (_e) {
+    // Ignore storage lookup error
+  }
+
+  // 2. Try fetching local token.json bundled with extension
+  try {
+    const url = browserAPI.runtime.getURL("token.json");
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.token) {
+        cachedAuthToken = data.token;
+        return cachedAuthToken;
+      }
+    }
+  } catch (_e) {
+    // Ignore fetch error if token.json not bundled
+  }
+
+  return "default-local-token";
+}
+
+async function connectWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
+  const token = await loadAuthToken();
+
   try {
     ws = new WebSocket(DEFAULT_WS_URL);
+    isAuthenticated = false;
 
     ws.onopen = () => {
       reconnectAttempts = 0;
-      console.log(`[OrbitBridge] Connected to ${DEFAULT_WS_URL}`);
-      sendBridgeEvent("connected");
+      console.log(`[OrbitBridge] Connected to ${DEFAULT_WS_URL}, sending handshake`);
+
+      // Step 1: Send ClientHello handshake
+      const hello = {
+        protocol_version: PROTOCOL_VERSION,
+        token: token,
+        extension_version: EXTENSION_VERSION,
+      };
+      ws.send(JSON.stringify(hello));
     };
 
     ws.onmessage = (event) => {
       try {
-        const envelope = JSON.parse(event.data);
-        handleBridgeCommand(envelope);
+        const data = JSON.parse(event.data);
+
+        // Check if this is the ServerHelloAck
+        if (!isAuthenticated && data.session_id && data.accepted !== undefined) {
+          if (data.accepted) {
+            isAuthenticated = true;
+            console.log(`[OrbitBridge] Handshake accepted by server (session: ${data.session_id})`);
+            sendBridgeEvent("connected");
+          } else {
+            console.error("[OrbitBridge] Server rejected handshake");
+            ws.close();
+          }
+          return;
+        }
+
+        // Regular bridge command envelope
+        handleBridgeCommand(data);
       } catch (err) {
         console.error("[OrbitBridge] Failed to parse message:", err);
       }
     };
 
-    ws.onclose = () => {
-      console.warn("[OrbitBridge] WebSocket connection closed, scheduling reconnect");
+    ws.onclose = (event) => {
+      isAuthenticated = false;
+      console.warn(`[OrbitBridge] WebSocket closed (code: ${event.code}), scheduling reconnect`);
       scheduleReconnect();
     };
 
@@ -49,7 +110,7 @@ function connectWebSocket() {
       ws.close();
     };
   } catch (err) {
-    console.error("[OrbitBridge] Connection error:", err);
+    console.error("[OrbitBridge] Connection setup error:", err);
     scheduleReconnect();
   }
 }
@@ -67,7 +128,7 @@ function scheduleReconnect() {
 }
 
 function sendBridgeEvent(type, payload = undefined) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !isAuthenticated) {
     return;
   }
 
@@ -84,7 +145,7 @@ async function handleBridgeCommand(envelope) {
 
     if (!tabs || tabs.length === 0) {
       console.warn("[OrbitBridge] No active ChatGPT tab found for command:", envelope);
-      sendBridgeEvent("session_unavailable", {
+      sendBridgeEvent("page_unavailable", {
         reason: "No active ChatGPT tab found",
       });
       return;
@@ -97,7 +158,7 @@ async function handleBridgeCommand(envelope) {
       (response) => {
         const lastErr = browserAPI.runtime.lastError;
         if (lastErr) {
-          console.warn("[OrbitBridge] Tab error:", lastErr.message);
+          console.warn("[OrbitBridge] Tab communication error:", lastErr.message);
         } else {
           console.log("[OrbitBridge] Tab response:", response);
         }
@@ -108,7 +169,7 @@ async function handleBridgeCommand(envelope) {
   }
 }
 
-// Listen for messages from content scripts
+// Forward messages from content scripts to WebSocket
 browserAPI.runtime.onMessage.addListener((message) => {
   if (message && message.source === "content_script" && message.event) {
     const { type, payload } = message.event;

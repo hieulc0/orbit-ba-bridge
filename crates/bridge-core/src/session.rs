@@ -5,13 +5,14 @@ use std::collections::{HashSet, VecDeque};
 
 pub const DEFAULT_MAX_SEEN_MESSAGES: usize = 1000;
 
-/// Lifecycle states of a bridge session.
+/// Runtime lifecycle states of an ephemeral browser connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Disconnected,
+    Connecting,
     Connected,
     PageReady,
-    ActiveConversation,
+    ConversationReady,
     Unavailable,
 }
 
@@ -21,6 +22,7 @@ pub struct SessionManager {
     session_id: SessionId,
     state: SessionState,
     conversation_id: Option<String>,
+    external_conversation_ref: Option<String>,
     seen_messages: HashSet<String>,
     message_order: VecDeque<String>,
     max_seen_history: usize,
@@ -32,6 +34,7 @@ impl SessionManager {
             session_id,
             state: SessionState::Disconnected,
             conversation_id: None,
+            external_conversation_ref: None,
             seen_messages: HashSet::new(),
             message_order: VecDeque::new(),
             max_seen_history: DEFAULT_MAX_SEEN_MESSAGES,
@@ -46,8 +49,16 @@ impl SessionManager {
         self.state
     }
 
+    pub fn set_state(&mut self, state: SessionState) {
+        self.state = state;
+    }
+
     pub fn conversation_id(&self) -> Option<&str> {
         self.conversation_id.as_deref()
+    }
+
+    pub fn external_conversation_ref(&self) -> Option<&str> {
+        self.external_conversation_ref.as_deref()
     }
 
     /// Update session state according to incoming event.
@@ -55,18 +66,47 @@ impl SessionManager {
     /// and `false` if it is a duplicate message that should be ignored.
     pub fn handle_event(&mut self, event: &BrowserEvent) -> bool {
         match event {
+            BrowserEvent::Hello { .. } => {
+                self.state = SessionState::Connecting;
+                true
+            }
             BrowserEvent::Connected => {
                 self.state = SessionState::Connected;
                 true
             }
-            BrowserEvent::PageReady => {
+            BrowserEvent::PageReady { .. } => {
                 self.state = SessionState::PageReady;
                 true
             }
-            BrowserEvent::ConversationDetected { conversation_id } => {
-                self.conversation_id = conversation_id.clone();
-                self.state = SessionState::ActiveConversation;
+            BrowserEvent::ConversationDetected {
+                conversation_id,
+                external_conversation_ref,
+            } => {
+                if let Some(c_id) = conversation_id {
+                    self.conversation_id = Some(c_id.clone());
+                }
+                if let Some(ext_ref) = external_conversation_ref {
+                    self.external_conversation_ref = Some(ext_ref.clone());
+                } else if self.external_conversation_ref.is_none() {
+                    self.external_conversation_ref = conversation_id.clone();
+                }
+                self.state = SessionState::ConversationReady;
                 true
+            }
+            BrowserEvent::UserMessageObserved {
+                external_message_id,
+                ..
+            }
+            | BrowserEvent::AssistantMessageObserved {
+                external_message_id,
+                ..
+            } => {
+                if self.is_duplicate(external_message_id) {
+                    false
+                } else {
+                    self.record_message(external_message_id.clone());
+                    true
+                }
             }
             BrowserEvent::AssistantMessage { message_id, .. }
             | BrowserEvent::UserMessage { message_id, .. } => {
@@ -77,8 +117,15 @@ impl SessionManager {
                     true
                 }
             }
-            BrowserEvent::SessionUnavailable { .. } => {
+            BrowserEvent::InjectionAccepted { .. } | BrowserEvent::InjectionMaterialized { .. } => {
+                true
+            }
+            BrowserEvent::PageUnavailable { .. } | BrowserEvent::SessionUnavailable { .. } => {
                 self.state = SessionState::Unavailable;
+                true
+            }
+            BrowserEvent::Disconnected => {
+                self.state = SessionState::Disconnected;
                 true
             }
         }
@@ -93,17 +140,16 @@ impl SessionManager {
     fn record_message(&mut self, message_id: String) {
         if self.seen_messages.insert(message_id.clone()) {
             self.message_order.push_back(message_id);
-            if self.message_order.len() > self.max_seen_history {
-                if let Some(oldest) = self.message_order.pop_front() {
-                    self.seen_messages.remove(&oldest);
-                }
+            if self.message_order.len() > self.max_seen_history
+                && let Some(oldest) = self.message_order.pop_front()
+            {
+                self.seen_messages.remove(&oldest);
             }
         }
     }
 
-    /// Resets session tracking on reconnection or new page context.
+    /// Reset connection state without clearing conversation references or message deduplication caches.
     pub fn reset_connection(&mut self) {
         self.state = SessionState::Disconnected;
-        self.conversation_id = None;
     }
 }

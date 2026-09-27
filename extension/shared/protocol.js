@@ -4,6 +4,7 @@
 
 (function () {
   const PROTOCOL_VERSION = 1;
+  const EXTENSION_VERSION = "0.1.0";
   const DEFAULT_WS_URL = "ws://127.0.0.1:48117";
 
   /**
@@ -32,6 +33,7 @@
 
   globalThis.OrbitBridge = globalThis.OrbitBridge || {};
   globalThis.OrbitBridge.PROTOCOL_VERSION = PROTOCOL_VERSION;
+  globalThis.OrbitBridge.EXTENSION_VERSION = EXTENSION_VERSION;
   globalThis.OrbitBridge.DEFAULT_WS_URL = DEFAULT_WS_URL;
   globalThis.OrbitBridge.createEnvelope = createEnvelope;
 })();
