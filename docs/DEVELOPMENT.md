@@ -4,7 +4,7 @@
 
 - Rust (1.85+ recommended, 2024 edition)
 - Cargo
-- Chromium-based browser (for extension testing)
+- Chromium-based browser (primary implementation target) or Firefox
 
 ## Building the Workspace
 
@@ -38,8 +38,17 @@ cargo run --bin bridge-server -- --port 48117 --log-level debug
 
 ## Loading the Browser Extension
 
-1. Open Chrome / Chromium and navigate to `chrome://extensions`.
+### Chromium (Chrome, Edge, Brave) — Primary
+
+1. Open browser and navigate to `chrome://extensions`.
 2. Enable **Developer mode** (top right toggle).
-3. Click **Load unpacked** and select the `extension/` directory in this repository.
+3. Click **Load unpacked** and select the `extension/` directory.
 4. Open `https://chatgpt.com` in your browser.
-5. Watch the `bridge-server` console logs to observe the connection handshake and events.
+5. Check `bridge-server` console logs to observe the connection handshake and events.
+
+### Firefox (Dual-Browser Target)
+
+1. Copy or link `extension/manifest.firefox.json` as `manifest.json`.
+2. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`.
+3. Click **Load Temporary Add-on...** and select `extension/manifest.json`.
+4. Open `https://chatgpt.com` in Firefox.

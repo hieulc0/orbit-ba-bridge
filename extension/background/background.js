@@ -2,7 +2,13 @@
  * Background service worker managing WebSocket connectivity to bridge-server.
  */
 
-import { DEFAULT_WS_URL, createEnvelope } from "../shared/protocol.js";
+try {
+  importScripts("../shared/browser-compat.js", "../shared/protocol.js");
+} catch (e) {
+  console.error("[OrbitBridge] Failed to importScripts in background worker:", e);
+}
+
+const { browserAPI, DEFAULT_WS_URL, createEnvelope } = globalThis.OrbitBridge;
 
 const SESSION_ID = `ext-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 let ws = null;
@@ -20,7 +26,7 @@ function connectWebSocket() {
 
     ws.onopen = () => {
       reconnectAttempts = 0;
-      console.log(`[Bridge Extension] Connected to ${DEFAULT_WS_URL}`);
+      console.log(`[OrbitBridge] Connected to ${DEFAULT_WS_URL}`);
       sendBridgeEvent("connected");
     };
 
@@ -29,21 +35,21 @@ function connectWebSocket() {
         const envelope = JSON.parse(event.data);
         handleBridgeCommand(envelope);
       } catch (err) {
-        console.error("[Bridge Extension] Failed to parse message:", err);
+        console.error("[OrbitBridge] Failed to parse message:", err);
       }
     };
 
     ws.onclose = () => {
-      console.warn("[Bridge Extension] WebSocket connection closed, scheduling reconnect");
+      console.warn("[OrbitBridge] WebSocket connection closed, scheduling reconnect");
       scheduleReconnect();
     };
 
     ws.onerror = (err) => {
-      console.error("[Bridge Extension] WebSocket error:", err);
+      console.error("[OrbitBridge] WebSocket error:", err);
       ws.close();
     };
   } catch (err) {
-    console.error("[Bridge Extension] Connection error:", err);
+    console.error("[OrbitBridge] Connection error:", err);
     scheduleReconnect();
   }
 }
@@ -71,34 +77,39 @@ function sendBridgeEvent(type, payload = undefined) {
 }
 
 async function handleBridgeCommand(envelope) {
-  const tabs = await chrome.tabs.query({
-    url: "https://chatgpt.com/*",
-  });
-
-  if (tabs.length === 0) {
-    console.warn("[Bridge Extension] No active ChatGPT tab found for command:", envelope);
-    sendBridgeEvent("session_unavailable", {
-      reason: "No active ChatGPT tab found",
+  try {
+    const tabs = await browserAPI.tabs.query({
+      url: "https://chatgpt.com/*",
     });
-    return;
-  }
 
-  const targetTab = tabs.find((t) => t.active) || tabs[0];
-  chrome.tabs.sendMessage(
-    targetTab.id,
-    { command: { type: envelope.type, payload: envelope.payload } },
-    (response) => {
-      if (chrome.runtime.lastError) {
-        console.warn("[Bridge Extension] Tab error:", chrome.runtime.lastError.message);
-      } else {
-        console.log("[Bridge Extension] Tab response:", response);
-      }
+    if (!tabs || tabs.length === 0) {
+      console.warn("[OrbitBridge] No active ChatGPT tab found for command:", envelope);
+      sendBridgeEvent("session_unavailable", {
+        reason: "No active ChatGPT tab found",
+      });
+      return;
     }
-  );
+
+    const targetTab = tabs.find((t) => t.active) || tabs[0];
+    browserAPI.tabs.sendMessage(
+      targetTab.id,
+      { command: { type: envelope.type, payload: envelope.payload } },
+      (response) => {
+        const lastErr = browserAPI.runtime.lastError;
+        if (lastErr) {
+          console.warn("[OrbitBridge] Tab error:", lastErr.message);
+        } else {
+          console.log("[OrbitBridge] Tab response:", response);
+        }
+      }
+    );
+  } catch (err) {
+    console.error("[OrbitBridge] Error handling bridge command:", err);
+  }
 }
 
 // Listen for messages from content scripts
-chrome.runtime.onMessage.addListener((message) => {
+browserAPI.runtime.onMessage.addListener((message) => {
   if (message && message.source === "content_script" && message.event) {
     const { type, payload } = message.event;
     sendBridgeEvent(type, payload);
