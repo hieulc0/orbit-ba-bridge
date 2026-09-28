@@ -1,8 +1,13 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements resilient multi-strategy turn extraction (author-role -> articles -> content markers),
- * local debounced streaming detection, conversation-scoped message IDs, and duplicate suppression.
+ * Implements resilient multi-tier turn extraction:
+ * 1. Explicit author-role elements if both user & assistant tags exist.
+ * 2. Hierarchy turn container detection derived from user-role parent tree (guaranteed turn interleaving).
+ * 3. Fallback articles / testid inspection.
+ *
+ * Supports local debounced streaming detection, conversation-scoped message IDs,
+ * and duplicate suppression.
  */
 
 (function () {
@@ -10,7 +15,9 @@
     try {
       const clone = el.cloneNode(true);
       clone
-        .querySelectorAll("button, svg, h5, h6, [aria-hidden='true']")
+        .querySelectorAll(
+          "button, svg, h5, h6, [aria-hidden='true'], [class*='sr-only']"
+        )
         .forEach((n) => n.remove());
       const cleaned = clone.innerText.trim();
       if (cleaned) return cleaned;
@@ -18,31 +25,39 @@
     return (el.innerText || "").trim();
   }
 
-  function extractText(el, role) {
+  function extractTurnText(el, role) {
     if (role === "assistant") {
-      const md = el.classList?.contains("markdown")
-        ? el
-        : el.querySelector?.(".markdown, [class*='prose']");
-      if (md && md.innerText.trim()) return md.innerText.trim();
+      const contentEl =
+        el.querySelector(".markdown") ||
+        el.querySelector("[class*='prose']") ||
+        el.querySelector("[data-message-author-role='assistant']") ||
+        el.querySelector("[class*='text-message']");
+      if (contentEl) {
+        const t = cleanNodeText(contentEl);
+        if (t) return t;
+      }
     } else {
-      const bubble = el.classList?.contains("whitespace-pre-wrap")
-        ? el
-        : el.querySelector?.(
-            ".whitespace-pre-wrap, [class*='whitespace-pre-wrap'], div[dir='auto']"
-          );
-      if (bubble && bubble.innerText.trim()) return bubble.innerText.trim();
+      const userBubble =
+        el.querySelector("[data-message-author-role='user']") ||
+        el.querySelector(".whitespace-pre-wrap") ||
+        el.querySelector("[class*='whitespace-pre-wrap']") ||
+        el.querySelector("div[dir='auto']");
+      if (userBubble) {
+        const t = cleanNodeText(userBubble);
+        if (t) return t;
+      }
     }
     return cleanNodeText(el);
   }
 
-  function extractId(el, role, index, convId) {
+  function extractId(el, role, roleIndex, convId) {
     const directId =
       el.getAttribute?.("data-message-id") ||
       el.querySelector?.("[data-message-id]")?.getAttribute("data-message-id") ||
       el.closest?.("[data-message-id]")?.getAttribute("data-message-id");
 
     if (directId) return directId;
-    return `${convId || "conv"}-${role}-${index}`;
+    return `${convId || "conv"}-${role}-${roleIndex}`;
   }
 
   function isStreaming(el) {
@@ -53,85 +68,130 @@
     );
   }
 
-  function findTurns() {
-    // Strategy 1: Explicit author-role elements in DOM order
-    const authorRoleNodes = Array.from(
-      document.querySelectorAll("[data-message-author-role]")
+  function findConversationTurns() {
+    const userRoles = Array.from(
+      document.querySelectorAll("[data-message-author-role='user']")
     );
-    if (authorRoleNodes.length > 0) {
-      const hasUser = authorRoleNodes.some(
-        (n) => n.getAttribute("data-message-author-role") === "user"
-      );
-      const hasAssistant = authorRoleNodes.some(
-        (n) => n.getAttribute("data-message-author-role") === "assistant"
-      );
-      // Only return early if both roles or at least user turns are present
-      if (hasUser && hasAssistant) {
-        return authorRoleNodes.map((el) => {
-          const role = el.getAttribute("data-message-author-role");
-          return { el, role: role === "user" ? "user" : "assistant" };
+    const assistantRoles = Array.from(
+      document.querySelectorAll("[data-message-author-role='assistant']")
+    );
+
+    // Tier 1: Explicit user AND assistant author-roles
+    if (userRoles.length > 0 && assistantRoles.length > 0) {
+      let userCount = 0;
+      let assistantCount = 0;
+      const all = [
+        ...userRoles.map((el) => ({ el, role: "user" })),
+        ...assistantRoles.map((el) => ({ el, role: "assistant" })),
+      ];
+      all.sort((a, b) => {
+        const pos = a.el.compareDocumentPosition(b.el);
+        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+      });
+      return all.map((t) => {
+        const roleIndex = t.role === "user" ? userCount++ : assistantCount++;
+        return { el: t.el, role: t.role, roleIndex };
+      });
+    }
+
+    // Tier 2: Turn containers derived from user-role parent hierarchy
+    if (userRoles.length > 0) {
+      let curr = userRoles[0];
+      let turnContainer = null;
+      while (
+        curr &&
+        curr.parentElement &&
+        curr.parentElement.tagName.toLowerCase() !== "main" &&
+        curr.parentElement !== document.body
+      ) {
+        const parent = curr.parentElement;
+        const children = Array.from(parent.children);
+        const userMatches = children.filter(
+          (c) =>
+            c.getAttribute("data-message-author-role") === "user" ||
+            Boolean(c.querySelector("[data-message-author-role='user']"))
+        ).length;
+
+        if (userMatches >= 2 || (userRoles.length === 1 && children.length >= 2)) {
+          turnContainer = parent;
+          break;
+        }
+        curr = parent;
+      }
+
+      if (turnContainer) {
+        const turns = [];
+        let userCount = 0;
+        let assistantCount = 0;
+        const children = Array.from(turnContainer.children);
+
+        children.forEach((child) => {
+          if (
+            child.querySelector("form") ||
+            child.querySelector("#prompt-textarea") ||
+            child.tagName.toLowerCase() === "form"
+          ) {
+            return;
+          }
+
+          const isUser = Boolean(
+            child.getAttribute("data-message-author-role") === "user" ||
+              child.querySelector("[data-message-author-role='user']")
+          );
+          const role = isUser ? "user" : "assistant";
+          const text = extractTurnText(child, role);
+
+          if (
+            !text ||
+            text === "Ready when you are." ||
+            text === "What can I help with today?"
+          ) {
+            return;
+          }
+
+          const roleIndex = isUser ? userCount++ : assistantCount++;
+          turns.push({ el: child, role, roleIndex, text });
         });
+
+        if (turns.length > 0) {
+          return turns;
+        }
       }
     }
 
-    // Strategy 2: Turn container wrappers (articles or testids)
-    const turnContainers = Array.from(
+    // Tier 3: Universal container & article fallback
+    const articles = Array.from(
       document.querySelectorAll(
         "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
       )
     );
-    if (turnContainers.length > 0) {
-      return turnContainers.map((container, index) => {
-        const roleEl = container.querySelector("[data-message-author-role]");
-        if (roleEl) {
-          const role = roleEl.getAttribute("data-message-author-role");
-          return { el: roleEl, role: role === "user" ? "user" : "assistant" };
-        }
-        if (
-          container.querySelector(
-            ".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']"
-          )
-        ) {
-          return { el: container, role: "assistant" };
-        }
-        if (
-          container.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
-        ) {
-          return { el: container, role: "user" };
-        }
-        return { el: container, role: index % 2 === 0 ? "user" : "assistant" };
-      });
+    if (articles.length > 0) {
+      let userCount = 0;
+      let assistantCount = 0;
+      return articles
+        .map((container, index) => {
+          const isUser = Boolean(
+            container.getAttribute("data-message-author-role") === "user" ||
+              container.querySelector("[data-message-author-role='user']") ||
+              container.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
+          );
+          const role = isUser ? "user" : (index % 2 === 0 ? "user" : "assistant");
+          const roleIndex = role === "user" ? userCount++ : assistantCount++;
+          return { el: container, role, roleIndex };
+        })
+        .filter((t) => {
+          const text = extractTurnText(t.el, t.role);
+          return Boolean(
+            text &&
+              text !== "Ready when you are." &&
+              text !== "What can I help with today?"
+          );
+        });
     }
 
-    // Strategy 3: Universal content marker scan
-    const main = document.querySelector("main") || document.body;
-    const assistantNodes = Array.from(
-      main.querySelectorAll(".markdown, [class*='prose']")
-    );
-    const userNodes = Array.from(
-      main.querySelectorAll(
-        "[data-message-author-role='user'], .whitespace-pre-wrap, [class*='whitespace-pre-wrap']"
-      )
-    ).filter(
-      (el) =>
-        !el.closest("form") &&
-        !el.closest("#prompt-textarea") &&
-        !el.isContentEditable
-    );
-
-    const allTurns = [
-      ...assistantNodes.map((el) => ({ el, role: "assistant" })),
-      ...userNodes.map((el) => ({ el, role: "user" })),
-    ];
-
-    allTurns.sort((a, b) => {
-      const pos = a.el.compareDocumentPosition(b.el);
-      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-      return 0;
-    });
-
-    return allTurns;
+    return [];
   }
 
   class DomObserver {
@@ -214,17 +274,18 @@
 
     scanMessages() {
       const convId = this.currentConversationId;
-      const turns = findTurns();
+      const turns = findConversationTurns();
 
       if (turns.length > 0) {
         console.log(
-          `[OrbitBridge DOM] scanMessages found ${turns.length} turns (conv: ${convId})`
+          `[OrbitBridge DOM] scanMessages found ${turns.length} turns (conv: ${convId}):`,
+          turns.map((t) => `${t.role}[${t.roleIndex}]`)
         );
       }
 
-      turns.forEach((turn, index) => {
-        const { el, role } = turn;
-        const text = extractText(el, role);
+      turns.forEach((turn) => {
+        const { el, role, roleIndex } = turn;
+        const text = turn.text || extractTurnText(el, role);
         if (
           !text ||
           text === "Ready when you are." ||
@@ -233,7 +294,7 @@
           return;
         }
 
-        const messageId = extractId(el, role, index, convId);
+        const messageId = extractId(el, role, roleIndex, convId);
 
         if (role === "user") {
           this.handleUserMessage(messageId, text);
@@ -317,7 +378,7 @@
       }
 
       this.activeStreaming.delete(messageId);
-      const latestText = extractText(el, "assistant") || item.text;
+      const latestText = extractTurnText(el, "assistant") || item.text;
       this.finalizeAssistantMessageWithText(messageId, latestText);
     }
 
