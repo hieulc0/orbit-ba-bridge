@@ -6,30 +6,27 @@
  */
 
 (function () {
+  function isVisible(el) {
+    if (!el) return false;
+    return Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  }
+
   function determineRole(el) {
-    // 1. Direct attribute
+    // 1. Direct or child attribute
     const directRole = el.getAttribute("data-message-author-role");
     if (directRole === "user" || directRole === "assistant") return directRole;
 
-    // 2. Child or parent attribute
     const childRole = el
       .querySelector("[data-message-author-role]")
       ?.getAttribute("data-message-author-role");
     if (childRole === "user" || childRole === "assistant") return childRole;
 
-    const parentRole = el
-      .closest("[data-message-author-role]")
-      ?.getAttribute("data-message-author-role");
-    if (parentRole === "user" || parentRole === "assistant") return parentRole;
-
-    // 3. data-testid indicators
+    // 2. data-testid indicators
     const testId = (el.getAttribute("data-testid") || "").toLowerCase();
     if (testId.includes("user")) return "user";
     if (testId.includes("assistant")) return "assistant";
-    if (el.querySelector("[data-testid*='user']")) return "user";
-    if (el.querySelector("[data-testid*='assistant']")) return "assistant";
 
-    // 4. Aria-labels (e.g. "You said:", "ChatGPT said:")
+    // 3. Aria-labels (e.g. "You said:", "ChatGPT said:")
     const ariaLabel = (
       el.getAttribute("aria-label") ||
       el.querySelector("[aria-label]")?.getAttribute("aria-label") ||
@@ -38,26 +35,17 @@
     if (ariaLabel.includes("you said")) return "user";
     if (ariaLabel.includes("chatgpt said")) return "assistant";
 
-    // 5. Action buttons
+    // 4. Content structure: assistant messages contain markdown/prose or copy button
     if (
       el.querySelector(
-        "button[aria-label*='Copy'], button[data-testid*='copy'], button[aria-label*='Read aloud']"
+        ".markdown, [class*='prose'], button[aria-label*='Copy'], button[data-testid*='copy'], button[aria-label*='Read aloud']"
       )
     ) {
       return "assistant";
     }
-    if (
-      el.querySelector("button[aria-label*='Edit'], button[data-testid*='edit']")
-    ) {
-      return "user";
-    }
 
-    // 6. Content structure
-    if (el.querySelector(".markdown, [class*='prose']")) {
-      return "assistant";
-    }
-
-    return null;
+    // 5. Default to user if it contains user message bubbles or pre-wrap text
+    return "user";
   }
 
   function extractMessageText(el) {
@@ -102,7 +90,7 @@
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.activeStreaming = new Map(); // id -> { text, timer }
+      this.activeStreaming = new Map(); // id -> { text, timer, unchangedCount }
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
@@ -114,7 +102,7 @@
     }
 
     start() {
-      console.log("[OrbitBridge DOM] Starting DOM observer");
+      console.log("[OrbitBridge DOM] Starting DOM observer on", window.location.href);
       this.detectConversation();
       this.scanMessages();
 
@@ -130,7 +118,7 @@
         characterData: true,
       });
 
-      // Background periodic polling every 1.5s to handle dynamic lazy/virtual rendering
+      // Background periodic polling every 1.5s to handle lazy/virtual rendering
       this.pollInterval = setInterval(() => {
         this.detectConversation();
         this.scanMessages();
@@ -173,7 +161,7 @@
         });
 
         // Trigger staggered scans to accommodate async network fetch of conversation turns
-        [200, 600, 1200, 2500].forEach((delay) => {
+        [300, 800, 1500, 3000].forEach((delay) => {
           setTimeout(() => this.scanMessages(), delay);
         });
       }
@@ -184,12 +172,21 @@
         document.querySelector("button[data-testid='stop-button']") ||
         document.querySelector("button[aria-label='Stop generating']") ||
         document.querySelector("button[aria-label='Stop streaming']");
+
+      if (stopBtn && isVisible(stopBtn) && !stopBtn.disabled) {
+        return true;
+      }
+
       const streamingEl = document.querySelector(".result-streaming");
-      return Boolean(stopBtn || streamingEl);
+      if (streamingEl && isVisible(streamingEl)) {
+        return true;
+      }
+
+      return false;
     }
 
     scanMessages() {
-      // 1. Direct query for authoritative message containers
+      // 1. Check for standard authoritative message containers
       const messageNodes = document.querySelectorAll(
         "[data-message-author-role='user'], [data-message-author-role='assistant']"
       );
@@ -211,26 +208,26 @@
         return;
       }
 
-      // 2. Fallback: match <article> or turn elements
+      // 2. Fallback: query articles and conversation turn containers
       const turns = document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-']"
+        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
       );
 
-      turns.forEach((el, index) => {
-        const role = determineRole(el);
-        if (!role) return;
+      if (turns.length > 0) {
+        turns.forEach((el, index) => {
+          const role = determineRole(el);
+          const rawId = extractMessageId(el, role, index);
+          const text = extractMessageText(el);
 
-        const rawId = extractMessageId(el, role, index);
-        const text = extractMessageText(el);
+          if (!text) return;
 
-        if (!text) return;
-
-        if (role === "user") {
-          this.handleUserMessage(rawId, text);
-        } else if (role === "assistant") {
-          this.handleAssistantMessage(rawId, text, el);
-        }
-      });
+          if (role === "user") {
+            this.handleUserMessage(rawId, text);
+          } else if (role === "assistant") {
+            this.handleAssistantMessage(rawId, text, el);
+          }
+        });
+      }
     }
 
     handleUserMessage(messageId, text) {
@@ -239,11 +236,7 @@
       }
 
       this.seenMessageIds.add(messageId);
-      console.log(`[OrbitBridge DOM] Emitting user_message_observed:`, {
-        messageId,
-        length: text.length,
-        snippet: text.slice(0, 40),
-      });
+      console.log(`[OrbitBridge DOM] >>> Emitting user_message_observed (${messageId}):`, text.slice(0, 50));
 
       // Check if this matches a pending external injection
       if (this.pendingInjection) {
@@ -284,7 +277,20 @@
         if (this.activeStreaming.has(messageId)) {
           const item = this.activeStreaming.get(messageId);
           clearTimeout(item.timer);
-          item.text = text;
+
+          // If text hasn't changed over multiple checks, force finalize
+          if (item.text === text) {
+            item.unchangedCount = (item.unchangedCount || 0) + 1;
+            if (item.unchangedCount >= 3) {
+              this.activeStreaming.delete(messageId);
+              this.finalizeAssistantMessageWithText(messageId, text);
+              return;
+            }
+          } else {
+            item.text = text;
+            item.unchangedCount = 0;
+          }
+
           item.timer = setTimeout(() => {
             this.finalizeAssistantMessage(messageId);
           }, 800);
@@ -292,7 +298,7 @@
           const timer = setTimeout(() => {
             this.finalizeAssistantMessage(messageId);
           }, 800);
-          this.activeStreaming.set(messageId, { text, timer });
+          this.activeStreaming.set(messageId, { text, timer, unchangedCount: 0 });
         }
         return;
       }
@@ -301,20 +307,16 @@
     }
 
     finalizeAssistantMessage(messageId) {
-      if (this.isGenerating()) {
-        const item = this.activeStreaming.get(messageId);
-        if (item) {
-          clearTimeout(item.timer);
-          item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId), 600);
-        }
+      const item = this.activeStreaming.get(messageId);
+      if (!item) return;
+
+      if (this.isGenerating() && item.unchangedCount < 3) {
+        item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId), 600);
         return;
       }
 
-      const item = this.activeStreaming.get(messageId);
-      if (item) {
-        this.activeStreaming.delete(messageId);
-        this.finalizeAssistantMessageWithText(messageId, item.text);
-      }
+      this.activeStreaming.delete(messageId);
+      this.finalizeAssistantMessageWithText(messageId, item.text);
     }
 
     finalizeAssistantMessageWithText(messageId, text) {
@@ -323,11 +325,7 @@
       }
 
       this.seenMessageIds.add(messageId);
-      console.log(`[OrbitBridge DOM] Emitting assistant_message_observed:`, {
-        messageId,
-        length: text.length,
-        snippet: text.slice(0, 40),
-      });
+      console.log(`[OrbitBridge DOM] >>> Emitting assistant_message_observed (${messageId}):`, text.slice(0, 50));
 
       this.onEvent({
         type: "assistant_message_observed",
