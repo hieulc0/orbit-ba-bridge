@@ -57,6 +57,7 @@
       const convId = match ? match[1] : null;
       if (convId !== this.currentConversationId) {
         this.currentConversationId = convId;
+        this.seenMessageIds.clear();
         this.onEvent({
           type: "conversation_detected",
           payload: {
@@ -64,6 +65,8 @@
             external_conversation_ref: convId,
           },
         });
+        // Immediately scan messages for newly selected conversation
+        setTimeout(() => this.scanMessages(), 100);
       }
     }
 
@@ -77,11 +80,39 @@
     }
 
     scanMessages() {
-      const turns = document.querySelectorAll(
-        "article, [data-message-author-role], [data-testid^='conversation-turn-']"
-      );
+      // 1. Primary: match elements with explicit data-message-author-role
+      const roleElements = document.querySelectorAll("[data-message-author-role]");
+      if (roleElements.length > 0) {
+        roleElements.forEach((el, index) => {
+          const role = el.getAttribute("data-message-author-role");
+          if (!role || (role !== "user" && role !== "assistant")) return;
 
-      turns.forEach((el, index) => {
+          const article = el.closest("article");
+          const rawId =
+            el.getAttribute("data-message-id") ||
+            (article && article.getAttribute("data-testid")) ||
+            `turn-${index}`;
+
+          const textEl =
+            el.querySelector(".markdown") ||
+            el.querySelector(".whitespace-pre-wrap") ||
+            el;
+          const text = textEl.innerText.trim();
+
+          if (!text) return;
+
+          if (role === "user") {
+            this.handleUserMessage(rawId, text);
+          } else if (role === "assistant") {
+            this.handleAssistantMessage(rawId, text, el);
+          }
+        });
+        return;
+      }
+
+      // 2. Fallback: match <article> elements
+      const articles = document.querySelectorAll("article, [data-testid^='conversation-turn-']");
+      articles.forEach((el, index) => {
         const role =
           el.getAttribute("data-message-author-role") ||
           (el.querySelector("[data-message-author-role='assistant']")
