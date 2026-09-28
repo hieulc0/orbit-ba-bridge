@@ -1,51 +1,14 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements robust multi-strategy role detection, debounced streaming assistant
- * detection, duplicate suppression, and stable external message ID extraction.
+ * Implements a robust 3-tier extraction engine (data-roles -> turn articles -> text/markdown blocks),
+ * debounced streaming assistant detection, duplicate suppression, and stable message IDs.
  */
 
 (function () {
   function isVisible(el) {
     if (!el) return false;
     return Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  }
-
-  function determineRole(el) {
-    // 1. Direct or child attribute
-    const directRole = el.getAttribute("data-message-author-role");
-    if (directRole === "user" || directRole === "assistant") return directRole;
-
-    const childRole = el
-      .querySelector("[data-message-author-role]")
-      ?.getAttribute("data-message-author-role");
-    if (childRole === "user" || childRole === "assistant") return childRole;
-
-    // 2. data-testid indicators
-    const testId = (el.getAttribute("data-testid") || "").toLowerCase();
-    if (testId.includes("user")) return "user";
-    if (testId.includes("assistant")) return "assistant";
-
-    // 3. Aria-labels (e.g. "You said:", "ChatGPT said:")
-    const ariaLabel = (
-      el.getAttribute("aria-label") ||
-      el.querySelector("[aria-label]")?.getAttribute("aria-label") ||
-      ""
-    ).toLowerCase();
-    if (ariaLabel.includes("you said")) return "user";
-    if (ariaLabel.includes("chatgpt said")) return "assistant";
-
-    // 4. Content structure: assistant messages contain markdown/prose or copy button
-    if (
-      el.querySelector(
-        ".markdown, [class*='prose'], button[aria-label*='Copy'], button[data-testid*='copy'], button[aria-label*='Read aloud']"
-      )
-    ) {
-      return "assistant";
-    }
-
-    // 5. Default to user if it contains user message bubbles or pre-wrap text
-    return "user";
   }
 
   function extractMessageText(el) {
@@ -61,7 +24,6 @@
       if (text) return text;
     }
 
-    // Fallback: clone element and remove UI buttons, icons, headers
     try {
       const clone = el.cloneNode(true);
       clone
@@ -106,7 +68,6 @@
       this.detectConversation();
       this.scanMessages();
 
-      // Mutation observer for real-time reactivity
       this.observer = new MutationObserver(() => {
         this.detectConversation();
         this.scanMessages();
@@ -118,7 +79,6 @@
         characterData: true,
       });
 
-      // Background periodic polling every 1.5s to handle lazy/virtual rendering
       this.pollInterval = setInterval(() => {
         this.detectConversation();
         this.scanMessages();
@@ -160,7 +120,6 @@
           },
         });
 
-        // Trigger staggered scans to accommodate async network fetch of conversation turns
         [300, 800, 1500, 3000].forEach((delay) => {
           setTimeout(() => this.scanMessages(), delay);
         });
@@ -186,48 +145,74 @@
     }
 
     scanMessages() {
-      // 1. Check for standard authoritative message containers
-      const messageNodes = document.querySelectorAll(
-        "[data-message-author-role='user'], [data-message-author-role='assistant']"
+      // Tier 1: Authoritative attributes
+      let userNodes = Array.from(
+        document.querySelectorAll("[data-message-author-role='user']")
+      );
+      let assistantNodes = Array.from(
+        document.querySelectorAll("[data-message-author-role='assistant']")
       );
 
-      if (messageNodes.length > 0) {
-        messageNodes.forEach((node, index) => {
-          const role = node.getAttribute("data-message-author-role");
-          const rawId = extractMessageId(node, role, index);
-          const text = extractMessageText(node);
-
-          if (!text) return;
-
-          if (role === "user") {
-            this.handleUserMessage(rawId, text);
-          } else if (role === "assistant") {
-            this.handleAssistantMessage(rawId, text, node);
-          }
-        });
-        return;
-      }
-
-      // 2. Fallback: query articles and conversation turn containers
-      const turns = document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
-      );
-
-      if (turns.length > 0) {
-        turns.forEach((el, index) => {
-          const role = determineRole(el);
-          const rawId = extractMessageId(el, role, index);
-          const text = extractMessageText(el);
-
-          if (!text) return;
-
-          if (role === "user") {
-            this.handleUserMessage(rawId, text);
-          } else if (role === "assistant") {
-            this.handleAssistantMessage(rawId, text, el);
+      // Tier 2: Turn articles and conversation-turn containers
+      if (userNodes.length === 0 && assistantNodes.length === 0) {
+        const articles = document.querySelectorAll(
+          "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
+        );
+        articles.forEach((art) => {
+          if (
+            art.querySelector(
+              ".markdown, [class*='prose'], button[aria-label*='Copy'], button[data-testid*='copy']"
+            )
+          ) {
+            assistantNodes.push(art);
+          } else if (
+            art.querySelector(".whitespace-pre-wrap") ||
+            (art.innerText && art.innerText.trim())
+          ) {
+            userNodes.push(art);
           }
         });
       }
+
+      // Tier 3: Universal fallback by content class
+      if (userNodes.length === 0 && assistantNodes.length === 0) {
+        document.querySelectorAll(".markdown, [class*='prose']").forEach((el) => {
+          assistantNodes.push(el);
+        });
+        document.querySelectorAll(".whitespace-pre-wrap").forEach((el) => {
+          if (
+            !el.closest("form") &&
+            !el.closest("#prompt-textarea") &&
+            !el.isContentEditable
+          ) {
+            userNodes.push(el);
+          }
+        });
+      }
+
+      if (userNodes.length > 0 || assistantNodes.length > 0) {
+        console.log(
+          `[OrbitBridge DOM] Scan result: ${userNodes.length} user nodes, ${assistantNodes.length} assistant nodes`
+        );
+      }
+
+      // Process user messages
+      userNodes.forEach((node, index) => {
+        const rawId = extractMessageId(node, "user", index);
+        const text = extractMessageText(node);
+        if (text) {
+          this.handleUserMessage(rawId, text);
+        }
+      });
+
+      // Process assistant messages
+      assistantNodes.forEach((node, index) => {
+        const rawId = extractMessageId(node, "assistant", index);
+        const text = extractMessageText(node);
+        if (text) {
+          this.handleAssistantMessage(rawId, text, node);
+        }
+      });
     }
 
     handleUserMessage(messageId, text) {
@@ -236,7 +221,10 @@
       }
 
       this.seenMessageIds.add(messageId);
-      console.log(`[OrbitBridge DOM] >>> Emitting user_message_observed (${messageId}):`, text.slice(0, 50));
+      console.log(
+        `[OrbitBridge DOM] >>> Emitting user_message_observed (${messageId}):`,
+        text.slice(0, 50)
+      );
 
       // Check if this matches a pending external injection
       if (this.pendingInjection) {
@@ -278,7 +266,6 @@
           const item = this.activeStreaming.get(messageId);
           clearTimeout(item.timer);
 
-          // If text hasn't changed over multiple checks, force finalize
           if (item.text === text) {
             item.unchangedCount = (item.unchangedCount || 0) + 1;
             if (item.unchangedCount >= 3) {
@@ -325,7 +312,10 @@
       }
 
       this.seenMessageIds.add(messageId);
-      console.log(`[OrbitBridge DOM] >>> Emitting assistant_message_observed (${messageId}):`, text.slice(0, 50));
+      console.log(
+        `[OrbitBridge DOM] >>> Emitting assistant_message_observed (${messageId}):`,
+        text.slice(0, 50)
+      );
 
       this.onEvent({
         type: "assistant_message_observed",

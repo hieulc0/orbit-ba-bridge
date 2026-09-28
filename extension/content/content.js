@@ -3,12 +3,17 @@
  */
 
 (function () {
+  if (globalThis.__orbitBridgeContentInjected) {
+    console.log("[OrbitBridge Content] Already injected in this frame, skipping duplicate initialization");
+    return;
+  }
+  globalThis.__orbitBridgeContentInjected = true;
+
   const { browserAPI, DomObserver, ComposerController } = globalThis.OrbitBridge;
 
   const composer = new ComposerController();
 
   const observer = new DomObserver((event) => {
-    console.log("[OrbitBridge Content] Sending event to background:", event.type, event.payload);
     browserAPI.runtime.sendMessage({
       source: "content_script",
       event,
