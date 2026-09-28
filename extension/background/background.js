@@ -86,6 +86,7 @@ async function connectWebSocket() {
             console.log(`[OrbitBridge] Handshake accepted by server (session: ${data.session_id})`);
             sendBridgeEvent("connected");
             checkTabsCount();
+            injectAllOpenChatGPTTabs();
           } else {
             console.error("[OrbitBridge] Server rejected handshake");
             ws.close();
@@ -163,6 +164,39 @@ async function checkTabsCount() {
   }
 }
 
+async function ensureContentScriptInjected(tabId) {
+  try {
+    if (browserAPI.scripting && browserAPI.scripting.executeScript) {
+      await browserAPI.scripting.executeScript({
+        target: { tabId: tabId },
+        files: [
+          "shared/browser-compat.js",
+          "shared/protocol.js",
+          "content/dom.js",
+          "content/composer.js",
+          "content/content.js",
+        ],
+      });
+      console.log(`[OrbitBridge] Auto-injected content scripts into tab ${tabId}`);
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[OrbitBridge] Could not auto-inject into tab ${tabId}:`, err.message);
+  }
+  return false;
+}
+
+async function injectAllOpenChatGPTTabs() {
+  try {
+    const tabs = await browserAPI.tabs.query({ url: "https://chatgpt.com/*" });
+    if (tabs) {
+      for (const tab of tabs) {
+        await ensureContentScriptInjected(tab.id);
+      }
+    }
+  } catch (_e) {}
+}
+
 async function handleBridgeCommand(envelope) {
   try {
     const tabs = await browserAPI.tabs.query({
@@ -190,11 +224,13 @@ async function handleBridgeCommand(envelope) {
       browserAPI.tabs.sendMessage(
         tabId,
         { command: { type: envelope.type, payload: envelope.payload } },
-        (response) => {
+        async (response) => {
           const lastErr = browserAPI.runtime.lastError;
           if (lastErr) {
             if (retriesLeft > 0 && lastErr.message && lastErr.message.includes("Receiving end does not exist")) {
-              setTimeout(() => sendToTab(tabId, retriesLeft - 1), 500);
+              console.log(`[OrbitBridge] Content script missing on tab ${tabId}; auto-injecting...`);
+              await ensureContentScriptInjected(tabId);
+              setTimeout(() => sendToTab(tabId, retriesLeft - 1), 400);
             } else {
               console.warn("[OrbitBridge] Tab communication error:", lastErr.message);
             }
