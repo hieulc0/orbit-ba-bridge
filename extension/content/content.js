@@ -3,13 +3,14 @@
  */
 
 (function () {
-  if (globalThis.__orbitBridgeContentInjected) {
-    console.log("[OrbitBridge Content] Already injected in this frame, skipping duplicate initialization");
-    return;
-  }
-  globalThis.__orbitBridgeContentInjected = true;
-
   const { browserAPI, DomObserver, ComposerController } = globalThis.OrbitBridge;
+
+  // Cleanly teardown any prior observer if extension reloaded
+  if (globalThis.__orbitBridgeCurrentObserver) {
+    try {
+      globalThis.__orbitBridgeCurrentObserver.stop();
+    } catch (_e) {}
+  }
 
   const composer = new ComposerController();
 
@@ -20,6 +21,7 @@
     });
   });
 
+  globalThis.__orbitBridgeCurrentObserver = observer;
   observer.start();
 
   browserAPI.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -29,7 +31,6 @@
 
     switch (type) {
       case "inject_message": {
-        // 1. Immediately acknowledge acceptance of injection
         browserAPI.runtime.sendMessage({
           source: "content_script",
           event: {
@@ -38,7 +39,6 @@
           },
         });
 
-        // 2. Set pending injection tracking for DOM materialization
         observer.setPendingInjection({
           injection_id: payload.injection_id,
           correlation_id: payload.correlation_id,
@@ -46,13 +46,12 @@
           timestamp: Date.now(),
         });
 
-        // 3. Inject text through composer
         composer
           .sendMessage(payload.text)
           .then((result) => sendResponse({ success: true, result }))
           .catch((err) => sendResponse({ success: false, error: err.message }));
 
-        return true; // Keep response channel open for async execution
+        return true;
       }
 
       case "send_message":

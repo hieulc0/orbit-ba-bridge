@@ -122,41 +122,35 @@
     }
 
     scanMessages() {
-      // 1. Primary: query authoritative author-role elements in DOM order
-      const nodes = document.querySelectorAll(
-        "[data-message-author-role='user'], [data-message-author-role='assistant']"
-      );
-
-      if (nodes.length > 0) {
-        nodes.forEach((node, index) => {
-          const role = node.getAttribute("data-message-author-role");
-          const rawId = extractMessageId(node, role, index);
-          const text = extractMessageText(node);
-          if (!text) return;
-
-          if (role === "user") {
-            this.handleUserMessage(rawId, text);
-          } else if (role === "assistant") {
-            this.handleAssistantMessage(rawId, text, node);
-          }
-        });
-        return;
-      }
-
-      // 2. Fallback: query article turn containers
+      // 1. Primary: query article turn containers in DOM order
       const articles = document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-']"
+        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
       );
 
       if (articles.length > 0) {
         articles.forEach((art, index) => {
-          let role = "user";
-          if (art.querySelector("[data-message-author-role='assistant']")) {
-            role = "assistant";
-          } else if (art.querySelector("[data-message-author-role='user']")) {
+          let role = null;
+
+          // Check author-role attribute
+          const authorRole =
+            art.getAttribute("data-message-author-role") ||
+            art.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
+
+          if (authorRole === "user") {
             role = "user";
-          } else if (art.querySelector(".markdown, [class*='prose']")) {
+          } else if (authorRole === "assistant") {
             role = "assistant";
+          } else if (
+            art.querySelector(".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']")
+          ) {
+            role = "assistant";
+          } else if (
+            art.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
+          ) {
+            role = "user";
+          } else {
+            // Heuristic: even turns are user, odd turns are assistant
+            role = index % 2 === 0 ? "user" : "assistant";
           }
 
           const rawId = extractMessageId(art, role, index);
@@ -169,7 +163,24 @@
             this.handleAssistantMessage(rawId, text, art);
           }
         });
+        return;
       }
+
+      // 2. Fallback: direct query for user and assistant nodes
+      const userNodes = document.querySelectorAll("[data-message-author-role='user'], .whitespace-pre-wrap");
+      userNodes.forEach((node, index) => {
+        if (node.closest("form") || node.closest("#prompt-textarea") || node.isContentEditable) return;
+        const rawId = extractMessageId(node, "user", index);
+        const text = extractMessageText(node);
+        if (text) this.handleUserMessage(rawId, text);
+      });
+
+      const assistantNodes = document.querySelectorAll("[data-message-author-role='assistant'], .markdown, [class*='prose']");
+      assistantNodes.forEach((node, index) => {
+        const rawId = extractMessageId(node, "assistant", index);
+        const text = extractMessageText(node);
+        if (text) this.handleAssistantMessage(rawId, text, node);
+      });
     }
 
     handleUserMessage(messageId, text) {
