@@ -1,8 +1,8 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements chronological message extraction, local streaming detection via .result-streaming,
- * duplicate suppression, conversation-scoped message IDs, and robust fallback selectors.
+ * Implements resilient multi-strategy turn extraction (author-role -> articles -> content markers),
+ * local debounced streaming detection, conversation-scoped message IDs, and duplicate suppression.
  */
 
 (function () {
@@ -15,30 +15,123 @@
       const cleaned = clone.innerText.trim();
       if (cleaned) return cleaned;
     } catch (_e) {}
-    return el.innerText.trim();
+    return (el.innerText || "").trim();
   }
 
-  function extractMessageText(node, role) {
+  function extractText(el, role) {
     if (role === "assistant") {
-      const md = node.querySelector(".markdown, [class*='prose']");
+      const md = el.classList?.contains("markdown")
+        ? el
+        : el.querySelector?.(".markdown, [class*='prose']");
       if (md && md.innerText.trim()) return md.innerText.trim();
     } else {
-      const userBubble = node.querySelector(
-        ".whitespace-pre-wrap, [class*='whitespace-pre-wrap'], div[dir='auto']"
-      );
-      if (userBubble && userBubble.innerText.trim()) return userBubble.innerText.trim();
+      const bubble = el.classList?.contains("whitespace-pre-wrap")
+        ? el
+        : el.querySelector?.(
+            ".whitespace-pre-wrap, [class*='whitespace-pre-wrap'], div[dir='auto']"
+          );
+      if (bubble && bubble.innerText.trim()) return bubble.innerText.trim();
     }
-    return cleanNodeText(node);
+    return cleanNodeText(el);
   }
 
-  function extractMessageId(node, role, index, convId) {
+  function extractId(el, role, index, convId) {
     const directId =
-      node.getAttribute("data-message-id") ||
-      node.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
-      node.closest("[data-message-id]")?.getAttribute("data-message-id");
+      el.getAttribute?.("data-message-id") ||
+      el.querySelector?.("[data-message-id]")?.getAttribute("data-message-id") ||
+      el.closest?.("[data-message-id]")?.getAttribute("data-message-id");
 
     if (directId) return directId;
     return `${convId || "conv"}-${role}-${index}`;
+  }
+
+  function isStreaming(el) {
+    if (!el) return false;
+    return (
+      el.classList?.contains("result-streaming") ||
+      Boolean(el.querySelector?.(".result-streaming"))
+    );
+  }
+
+  function findTurns() {
+    // Strategy 1: Explicit author-role elements in DOM order
+    const authorRoleNodes = Array.from(
+      document.querySelectorAll("[data-message-author-role]")
+    );
+    if (authorRoleNodes.length > 0) {
+      const hasUser = authorRoleNodes.some(
+        (n) => n.getAttribute("data-message-author-role") === "user"
+      );
+      const hasAssistant = authorRoleNodes.some(
+        (n) => n.getAttribute("data-message-author-role") === "assistant"
+      );
+      // Only return early if both roles or at least user turns are present
+      if (hasUser && hasAssistant) {
+        return authorRoleNodes.map((el) => {
+          const role = el.getAttribute("data-message-author-role");
+          return { el, role: role === "user" ? "user" : "assistant" };
+        });
+      }
+    }
+
+    // Strategy 2: Turn container wrappers (articles or testids)
+    const turnContainers = Array.from(
+      document.querySelectorAll(
+        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
+      )
+    );
+    if (turnContainers.length > 0) {
+      return turnContainers.map((container, index) => {
+        const roleEl = container.querySelector("[data-message-author-role]");
+        if (roleEl) {
+          const role = roleEl.getAttribute("data-message-author-role");
+          return { el: roleEl, role: role === "user" ? "user" : "assistant" };
+        }
+        if (
+          container.querySelector(
+            ".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']"
+          )
+        ) {
+          return { el: container, role: "assistant" };
+        }
+        if (
+          container.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
+        ) {
+          return { el: container, role: "user" };
+        }
+        return { el: container, role: index % 2 === 0 ? "user" : "assistant" };
+      });
+    }
+
+    // Strategy 3: Universal content marker scan
+    const main = document.querySelector("main") || document.body;
+    const assistantNodes = Array.from(
+      main.querySelectorAll(".markdown, [class*='prose']")
+    );
+    const userNodes = Array.from(
+      main.querySelectorAll(
+        "[data-message-author-role='user'], .whitespace-pre-wrap, [class*='whitespace-pre-wrap']"
+      )
+    ).filter(
+      (el) =>
+        !el.closest("form") &&
+        !el.closest("#prompt-textarea") &&
+        !el.isContentEditable
+    );
+
+    const allTurns = [
+      ...assistantNodes.map((el) => ({ el, role: "assistant" })),
+      ...userNodes.map((el) => ({ el, role: "user" })),
+    ];
+
+    allTurns.sort((a, b) => {
+      const pos = a.el.compareDocumentPosition(b.el);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
+    return allTurns;
   }
 
   class DomObserver {
@@ -121,47 +214,17 @@
 
     scanMessages() {
       const convId = this.currentConversationId;
+      const turns = findTurns();
 
-      // 1. Primary: query authoritative author-role elements in DOM order
-      let messageNodes = Array.from(
-        document.querySelectorAll("[data-message-author-role]")
-      );
-
-      // 2. Fallback: query article turn containers if data-message-author-role not present
-      if (messageNodes.length === 0) {
-        messageNodes = Array.from(
-          document.querySelectorAll("article, [data-testid^='conversation-turn-']")
+      if (turns.length > 0) {
+        console.log(
+          `[OrbitBridge DOM] scanMessages found ${turns.length} turns (conv: ${convId})`
         );
       }
 
-      if (messageNodes.length === 0) return;
-
-      messageNodes.forEach((node, index) => {
-        let role = null;
-        const authorRole =
-          node.getAttribute("data-message-author-role") ||
-          node.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
-
-        if (authorRole === "user") {
-          role = "user";
-        } else if (authorRole === "assistant") {
-          role = "assistant";
-        } else if (
-          node.querySelector(
-            ".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']"
-          )
-        ) {
-          role = "assistant";
-        } else if (
-          node.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
-        ) {
-          role = "user";
-        } else {
-          role = index % 2 === 0 ? "user" : "assistant";
-        }
-
-        const rawId = extractMessageId(node, role, index, convId);
-        const text = extractMessageText(node, role);
+      turns.forEach((turn, index) => {
+        const { el, role } = turn;
+        const text = extractText(el, role);
         if (
           !text ||
           text === "Ready when you are." ||
@@ -170,10 +233,12 @@
           return;
         }
 
+        const messageId = extractId(el, role, index, convId);
+
         if (role === "user") {
-          this.handleUserMessage(rawId, text);
+          this.handleUserMessage(messageId, text);
         } else {
-          this.handleAssistantMessage(rawId, text, node);
+          this.handleAssistantMessage(messageId, text, el);
         }
       });
     }
@@ -219,11 +284,7 @@
         return;
       }
 
-      const isStreamingEl =
-        el.classList.contains("result-streaming") ||
-        Boolean(el.querySelector(".result-streaming"));
-
-      if (isStreamingEl) {
+      if (isStreaming(el)) {
         if (this.activeStreaming.has(messageId)) {
           const item = this.activeStreaming.get(messageId);
           clearTimeout(item.timer);
@@ -240,7 +301,6 @@
         return;
       }
 
-      // Generation complete: finalize immediately
       this.finalizeAssistantMessageWithText(messageId, text);
     }
 
@@ -248,18 +308,16 @@
       const item = this.activeStreaming.get(messageId);
       if (!item) return;
 
-      const stillStreaming =
-        el &&
-        (el.classList.contains("result-streaming") ||
-          Boolean(el.querySelector(".result-streaming")));
-
-      if (stillStreaming) {
-        item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId, el), 500);
+      if (isStreaming(el)) {
+        item.timer = setTimeout(
+          () => this.finalizeAssistantMessage(messageId, el),
+          500
+        );
         return;
       }
 
       this.activeStreaming.delete(messageId);
-      const latestText = extractMessageText(el, "assistant") || item.text;
+      const latestText = extractText(el, "assistant") || item.text;
       this.finalizeAssistantMessageWithText(messageId, latestText);
     }
 

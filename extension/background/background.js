@@ -154,7 +154,10 @@ async function checkTabsCount() {
     });
 
     if (tabs && tabs.length > 1) {
-      console.warn("[OrbitBridge] Multiple ChatGPT tabs detected:", tabs.length);
+      console.warn(
+        "[OrbitBridge] Multiple ChatGPT tabs detected:",
+        tabs.map((t) => ({ id: t.id, url: t.url, active: t.active }))
+      );
       sendBridgeEvent("page_unavailable", {
         reason: "MULTIPLE_CHATGPT_TABS: Keep only one ChatGPT tab open for bridge operation",
       });
@@ -214,7 +217,10 @@ async function handleBridgeCommand(envelope) {
     }
 
     if (tabs.length > 1) {
-      console.warn("[OrbitBridge] Multiple ChatGPT tabs detected:", tabs.length);
+      console.warn(
+        "[OrbitBridge] Multiple ChatGPT tabs detected:",
+        tabs.map((t) => ({ id: t.id, url: t.url, active: t.active }))
+      );
       sendBridgeEvent("page_unavailable", {
         reason: "MULTIPLE_CHATGPT_TABS: Keep only one ChatGPT tab open for bridge operation",
       });
