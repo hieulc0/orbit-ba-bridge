@@ -1,10 +1,13 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements resilient multi-tier turn extraction:
- * 1. Explicit author-role elements if both user & assistant tags exist.
- * 2. Hierarchy turn container detection derived from user-role parent tree (guaranteed turn interleaving).
- * 3. Fallback articles / testid inspection.
+ * Implements resilient multi-strategy turn extraction:
+ * 1. Top-level turn container attributes: [data-turn] (standard in modern chatgpt.com).
+ * 2. Conversation turn test IDs: [data-testid^="conversation-turn-"].
+ * 3. Semantic article turn wrappers: article.
+ * 4. Direct message author role markers: [data-message-author-role].
+ * 5. Role determination with multi-factor fallback (attributes -> UI action buttons -> DOM order).
+ * 6. Clean text extraction stripping interactive toolbars and screen-reader elements.
  *
  * Supports local debounced streaming detection, conversation-scoped message IDs,
  * and duplicate suppression.
@@ -22,26 +25,20 @@
       const cleaned = clone.innerText.trim();
       if (cleaned) return cleaned;
     } catch (_e) {}
-    return (el.innerText || "").trim();
+    return (el.innerText || el.textContent || "").trim();
   }
 
   function extractTurnText(el, role) {
     if (role === "assistant") {
-      const contentEl =
-        el.querySelector(".markdown") ||
-        el.querySelector("[class*='prose']") ||
-        el.querySelector("[data-message-author-role='assistant']") ||
-        el.querySelector("[class*='text-message']");
-      if (contentEl) {
-        const t = cleanNodeText(contentEl);
+      const md = el.querySelector(".markdown, [class*='prose']");
+      if (md) {
+        const t = cleanNodeText(md);
         if (t) return t;
       }
     } else {
-      const userBubble =
-        el.querySelector("[data-message-author-role='user']") ||
-        el.querySelector(".whitespace-pre-wrap") ||
-        el.querySelector("[class*='whitespace-pre-wrap']") ||
-        el.querySelector("div[dir='auto']");
+      const userBubble = el.querySelector(
+        ".whitespace-pre-wrap, [class*='whitespace-pre-wrap'], div[dir='auto']"
+      );
       if (userBubble) {
         const t = cleanNodeText(userBubble);
         if (t) return t;
@@ -50,14 +47,51 @@
     return cleanNodeText(el);
   }
 
-  function extractId(el, role, roleIndex, convId) {
+  function determineTurnRole(turnEl, index) {
+    // 1. Direct or descendant data-turn
+    const turn =
+      turnEl.getAttribute("data-turn") ||
+      turnEl.querySelector("[data-turn]")?.getAttribute("data-turn");
+    if (turn === "user" || turn === "assistant") return turn;
+
+    // 2. Direct or descendant data-message-author-role
+    const authorRole =
+      turnEl.getAttribute("data-message-author-role") ||
+      turnEl.querySelector("[data-message-author-role]")?.getAttribute(
+        "data-message-author-role"
+      );
+    if (authorRole === "user" || authorRole === "assistant") return authorRole;
+
+    // 3. Test IDs
+    const testId = turnEl.getAttribute("data-testid") || "";
+    if (testId.includes("user")) return "user";
+    if (testId.includes("assistant")) return "assistant";
+
+    // 4. Assistant UI action indicators (buttons exclusive to assistant replies)
+    const hasAssistantIndicators = Boolean(
+      turnEl.querySelector(
+        "button[aria-label*='Read aloud'], button[aria-label*='Listen'], button[aria-label*='Regenerate'], button[aria-label*='Try again'], button[aria-label*='Bad response'], button[aria-label*='Dislike'], button[aria-label*='Good response'], .markdown, [class*='prose']"
+      )
+    );
+    if (hasAssistantIndicators) return "assistant";
+
+    // 5. User UI action indicators (edit button)
+    const hasUserIndicators = Boolean(
+      turnEl.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
+    );
+    if (hasUserIndicators) return "user";
+
+    // 6. Chronological conversation alternating order
+    return index % 2 === 0 ? "user" : "assistant";
+  }
+
+  function extractTurnId(el, role, index, convId) {
     const directId =
       el.getAttribute?.("data-message-id") ||
-      el.querySelector?.("[data-message-id]")?.getAttribute("data-message-id") ||
-      el.closest?.("[data-message-id]")?.getAttribute("data-message-id");
-
+      el.querySelector?.("[data-message-id]")?.getAttribute("data-message-id");
     if (directId) return directId;
-    return `${convId || "conv"}-${role}-${roleIndex}`;
+
+    return `${convId || "conv"}-${role}-${index}`;
   }
 
   function isStreaming(el) {
@@ -69,136 +103,110 @@
   }
 
   function findConversationTurns() {
-    const userRoles = Array.from(
-      document.querySelectorAll("[data-message-author-role='user']")
-    );
-    const assistantRoles = Array.from(
-      document.querySelectorAll("[data-message-author-role='assistant']")
-    );
-
-    // Tier 1: Explicit user AND assistant author-roles
-    if (userRoles.length > 0 && assistantRoles.length > 0) {
-      let userCount = 0;
-      let assistantCount = 0;
-      const all = [
-        ...userRoles.map((el) => ({ el, role: "user" })),
-        ...assistantRoles.map((el) => ({ el, role: "assistant" })),
-      ];
-      all.sort((a, b) => {
-        const pos = a.el.compareDocumentPosition(b.el);
-        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-        if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-        return 0;
-      });
-      return all.map((t) => {
-        const roleIndex = t.role === "user" ? userCount++ : assistantCount++;
-        return { el: t.el, role: t.role, roleIndex };
-      });
+    // Strategy 1: [data-turn]
+    let turns = Array.from(document.querySelectorAll("[data-turn]"));
+    if (turns.length > 0) {
+      return turns.map((el, i) => ({
+        el,
+        role: determineTurnRole(el, i),
+        index: i,
+      }));
     }
 
-    // Tier 2: Turn containers derived from user-role parent hierarchy
-    if (userRoles.length > 0) {
-      let curr = userRoles[0];
-      let turnContainer = null;
-      while (
-        curr &&
-        curr.parentElement &&
-        curr.parentElement.tagName.toLowerCase() !== "main" &&
-        curr.parentElement !== document.body
-      ) {
-        const parent = curr.parentElement;
-        const children = Array.from(parent.children);
-        const userMatches = children.filter(
-          (c) =>
-            c.getAttribute("data-message-author-role") === "user" ||
-            Boolean(c.querySelector("[data-message-author-role='user']"))
-        ).length;
-
-        if (userMatches >= 2 || (userRoles.length === 1 && children.length >= 2)) {
-          turnContainer = parent;
-          break;
-        }
-        curr = parent;
-      }
-
-      if (turnContainer) {
-        const turns = [];
-        let userCount = 0;
-        let assistantCount = 0;
-        const children = Array.from(turnContainer.children);
-
-        children.forEach((child) => {
-          if (
-            child.querySelector("form") ||
-            child.querySelector("#prompt-textarea") ||
-            child.tagName.toLowerCase() === "form"
-          ) {
-            return;
-          }
-
-          const isUser = Boolean(
-            child.getAttribute("data-message-author-role") === "user" ||
-              child.querySelector("[data-message-author-role='user']")
-          );
-          const role = isUser ? "user" : "assistant";
-          const text = extractTurnText(child, role);
-
-          if (
-            !text ||
-            text === "Ready when you are." ||
-            text === "What can I help with today?"
-          ) {
-            return;
-          }
-
-          const roleIndex = isUser ? userCount++ : assistantCount++;
-          turns.push({ el: child, role, roleIndex, text });
-        });
-
-        if (turns.length > 0) {
-          return turns;
-        }
-      }
+    // Strategy 2: [data-testid^="conversation-turn-"]
+    turns = Array.from(
+      document.querySelectorAll("[data-testid^='conversation-turn-']")
+    );
+    if (turns.length > 0) {
+      return turns.map((el, i) => ({
+        el,
+        role: determineTurnRole(el, i),
+        index: i,
+      }));
     }
 
-    // Tier 3: Universal container & article fallback
-    const articles = Array.from(
-      document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
+    // Strategy 3: article wrappers
+    turns = Array.from(document.querySelectorAll("article"));
+    if (turns.length > 0) {
+      return turns.map((el, i) => ({
+        el,
+        role: determineTurnRole(el, i),
+        index: i,
+      }));
+    }
+
+    // Strategy 4: [data-message-author-role]
+    turns = Array.from(document.querySelectorAll("[data-message-author-role]"));
+    if (turns.length > 0) {
+      return turns.map((el, i) => ({
+        el,
+        role: determineTurnRole(el, i),
+        index: i,
+      }));
+    }
+
+    // Strategy 5: Universal content markers inside main
+    const main = document.querySelector("main") || document.body;
+    const userNodes = Array.from(
+      main.querySelectorAll(
+        ".whitespace-pre-wrap, [class*='whitespace-pre-wrap']"
       )
+    ).filter(
+      (el) =>
+        !el.closest("form") &&
+        !el.closest("#prompt-textarea") &&
+        !el.isContentEditable
     );
-    if (articles.length > 0) {
-      let userCount = 0;
-      let assistantCount = 0;
-      return articles
-        .map((container, index) => {
-          const isUser = Boolean(
-            container.getAttribute("data-message-author-role") === "user" ||
-              container.querySelector("[data-message-author-role='user']") ||
-              container.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
-          );
-          const role = isUser ? "user" : (index % 2 === 0 ? "user" : "assistant");
-          const roleIndex = role === "user" ? userCount++ : assistantCount++;
-          return { el: container, role, roleIndex };
-        })
-        .filter((t) => {
-          const text = extractTurnText(t.el, t.role);
-          return Boolean(
-            text &&
-              text !== "Ready when you are." &&
-              text !== "What can I help with today?"
-          );
-        });
-    }
+    const assistantNodes = Array.from(
+      main.querySelectorAll(".markdown, [class*='prose']")
+    );
 
-    return [];
+    const all = [
+      ...userNodes.map((el) => ({ el, role: "user" })),
+      ...assistantNodes.map((el) => ({ el, role: "assistant" })),
+    ];
+
+    all.sort((a, b) => {
+      const pos = a.el.compareDocumentPosition(b.el);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
+    return all.map((item, i) => ({
+      el: item.el,
+      role: item.role,
+      index: i,
+    }));
+  }
+
+  function logDomDiagnostic() {
+    try {
+      const main = document.querySelector("main") || document.body;
+      const elements = Array.from(
+        main.querySelectorAll(
+          "[data-turn], [data-message-author-role], [data-testid^='conversation-turn-'], article, .markdown, .whitespace-pre-wrap"
+        )
+      ).slice(0, 16);
+
+      console.log(
+        "[OrbitBridge DOM Diagnostic] Detected nodes:",
+        elements.map((el) => ({
+          tag: el.tagName.toLowerCase(),
+          turn: el.getAttribute("data-turn"),
+          role: el.getAttribute("data-message-author-role"),
+          testid: el.getAttribute("data-testid"),
+          text: (el.innerText || "").trim().slice(0, 32),
+        }))
+      );
+    } catch (_e) {}
   }
 
   class DomObserver {
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.activeStreaming = new Map(); // id -> { text, timer, el }
+      this.activeStreaming = new Map();
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
@@ -210,7 +218,10 @@
     }
 
     start() {
-      console.log("[OrbitBridge DOM] Starting DOM observer on", window.location.href);
+      console.log(
+        "[OrbitBridge DOM] Starting DOM observer on",
+        window.location.href
+      );
       this.detectConversation();
       this.scanMessages();
 
@@ -230,9 +241,12 @@
         this.scanMessages();
       }, 1500);
 
+      logDomDiagnostic();
       this.onEvent({
         type: "page_ready",
-        payload: { external_url: window.location.href },
+        payload: {
+          external_url: window.location.href,
+        },
       });
     }
 
@@ -279,13 +293,13 @@
       if (turns.length > 0) {
         console.log(
           `[OrbitBridge DOM] scanMessages found ${turns.length} turns (conv: ${convId}):`,
-          turns.map((t) => `${t.role}[${t.roleIndex}]`)
+          turns.map((t) => `${t.role}[${t.index}]`)
         );
       }
 
       turns.forEach((turn) => {
-        const { el, role, roleIndex } = turn;
-        const text = turn.text || extractTurnText(el, role);
+        const { el, role, index } = turn;
+        const text = extractTurnText(el, role);
         if (
           !text ||
           text === "Ready when you are." ||
@@ -294,7 +308,7 @@
           return;
         }
 
-        const messageId = extractId(el, role, roleIndex, convId);
+        const messageId = extractTurnId(el, role, index, convId);
 
         if (role === "user") {
           this.handleUserMessage(messageId, text);
