@@ -19,3 +19,15 @@ local-docs
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local bridge secrets, tokens and databases
+extension/token.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*bridge_token*
+*bridge-token*
+*.export.md
+*.export.json
+.local/
+logs/

@@ -1,5 +1,9 @@
-use bridge_core::{ActorRole, ParticipantSource, SqliteConversationStore};
-use bridge_server::{BridgeServer, Config};
+use bridge_core::SqliteConversationStore;
+use bridge_server::paths;
+use bridge_server::{
+    BridgeServer, Cli, Commands, Config, ConversationAction, execute_interactive_command,
+    handle_conversation_action,
+};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +19,7 @@ fn resolve_token(config: &Config) -> anyhow::Result<String> {
 
     let token_path = match &config.token_file {
         Some(p) => PathBuf::from(p),
-        None => PathBuf::from("target/bridge_token"),
+        None => paths::default_token_path(),
     };
 
     if token_path.exists()
@@ -33,7 +37,7 @@ fn resolve_token(config: &Config) -> anyhow::Result<String> {
     }
     let _ = std::fs::write(&token_path, &token);
 
-    // Also write to extension/token.json for seamless Chrome development loading
+    // Also write to extension/token.json for seamless local browser extension loading
     let ext_token_path = Path::new("extension/token.json");
     let ext_json = serde_json::json!({
         "token": &token,
@@ -44,9 +48,49 @@ fn resolve_token(config: &Config) -> anyhow::Result<String> {
     Ok(token)
 }
 
+fn open_store(db_path: &str) -> anyhow::Result<SqliteConversationStore> {
+    if db_path == ":memory:" {
+        SqliteConversationStore::open_in_memory()
+    } else {
+        if let Some(parent) = Path::new(db_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        SqliteConversationStore::open(db_path)
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::parse();
+    let cli = Cli::parse();
+
+    // -------------------------------------------------------------
+    // Branch 1: CLI Inspection / Export / Search Subcommands
+    // -------------------------------------------------------------
+    if let Some(Commands::Conversation(ref action)) = cli.command {
+        let explicit_db = match action {
+            ConversationAction::List { db_path, .. } => db_path.as_deref(),
+            ConversationAction::Show { db_path, .. } => db_path.as_deref(),
+            ConversationAction::Export { db_path, .. } => db_path.as_deref(),
+            ConversationAction::Search { db_path, .. } => db_path.as_deref(),
+        };
+
+        let default_db_str = paths::default_db_path().to_string_lossy().to_string();
+        let db_str = explicit_db
+            .or(cli.server_config.db_path.as_deref())
+            .unwrap_or(&default_db_str);
+
+        let store = open_store(db_str)?;
+        handle_conversation_action(action, &store).await?;
+        return Ok(());
+    }
+
+    // -------------------------------------------------------------
+    // Branch 2: Run Bridge Server Daemon
+    // -------------------------------------------------------------
+    let config = match cli.command {
+        Some(Commands::Run(cfg)) => cfg,
+        _ => cli.server_config,
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -56,28 +100,27 @@ async fn main() -> anyhow::Result<()> {
 
     let token = resolve_token(&config)?;
 
-    let db_path = config
-        .db_path
-        .clone()
-        .unwrap_or_else(|| "target/bridge_data.sqlite".to_string());
+    let default_db_str = paths::default_db_path().to_string_lossy().to_string();
+    let db_path = config.db_path.as_deref().unwrap_or(&default_db_str);
+    let store = Arc::new(open_store(db_path)?);
 
-    let store = if db_path == ":memory:" {
-        Arc::new(SqliteConversationStore::open_in_memory()?)
+    let masked_token = if token.len() > 8 {
+        format!("{}...{}", &token[..4], &token[token.len() - 4..])
     } else {
-        if let Some(parent) = Path::new(&db_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        Arc::new(SqliteConversationStore::open(&db_path)?)
+        "***".to_string()
     };
 
     println!("\n==============================================================");
     println!("orbit-ba-bridge server");
-    println!("Listening on: ws://{}:{}", config.host, config.port);
-    println!("Local bridge token: {}", token);
-    println!("SQLite store: {}", db_path);
-    println!("Extension token synced: extension/token.json");
+    println!(
+        "Listening on:           ws://{}:{}",
+        config.host, config.port
+    );
+    println!("SQLite store:           {}", db_path);
+    println!("Token status:           loaded ({})", masked_token);
+    println!("Extension token sync:   extension/token.json");
     if !config.non_interactive {
-        println!("Type 'help' for interactive injection commands");
+        println!("Interactive prompt:     Type 'help' for commands, 'quit' to stop");
     }
     println!("==============================================================\n");
 
@@ -97,103 +140,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Spawn interactive CLI if enabled
+    // Spawn interactive CLI prompt if enabled
     if !config.non_interactive {
         let cli_state = Arc::clone(&server_state);
         let cli_shutdown = shutdown_tx.clone();
+        let host = config.host.clone();
+        let port = config.port;
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                if trimmed == "quit" || trimmed == "exit" {
-                    println!("Exiting...");
-                    let _ = cli_shutdown.send(());
-                    break;
-                } else if trimmed == "help" {
-                    println!("\nAvailable commands:");
-                    println!(
-                        "  status                        - Show current connection & session status"
-                    );
-                    println!(
-                        "  inject sa <message>           - Inject message as Orbit SA (SystemArchitect)"
-                    );
-                    println!(
-                        "  inject ba_research <message>  - Inject message as BA Research (BusinessAnalyst)"
-                    );
-                    println!(
-                        "  messages                      - Display persisted conversation messages"
-                    );
-                    println!("  quit | exit                   - Stop server\n");
-                } else if trimmed == "status" {
-                    let sess_state = *cli_state.active_session_state.lock().await;
-                    let conv_opt = cli_state.active_conversation.lock().await;
-                    println!("\n--- Runtime Status ---");
-                    println!("Browser connection state: {:?}", sess_state);
-                    if let Some(c) = &*conv_opt {
-                        println!("Active conversation ID: {}", c.id);
-                        println!("External ref: {:?}", c.external_conversation_ref);
-                    } else {
-                        println!("Active conversation: None (waiting for page)");
-                    }
-                    println!("----------------------\n");
-                } else if trimmed == "messages" {
-                    match cli_state.list_messages().await {
-                        Ok(msgs) => {
-                            println!("\n--- Persisted Messages ({}) ---", msgs.len());
-                            for m in msgs {
-                                println!(
-                                    "[{:>2}] actor={} kind={:?} | {}",
-                                    m.sequence,
-                                    m.actor_id,
-                                    m.kind,
-                                    m.content.lines().next().unwrap_or("")
-                                );
-                            }
-                            println!("-------------------------------\n");
-                        }
-                        Err(e) => println!("Error listing messages: {}", e),
-                    }
-                } else if trimmed.starts_with("inject ") {
-                    let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
-                    if parts.len() < 3 {
-                        println!("Usage: inject <sa|ba_research> <message>");
-                        continue;
-                    }
-                    let target_role = parts[1];
-                    let text = parts[2];
-
-                    let (role, name, source) = match target_role {
-                        "sa" | "orbit_sa" => (
-                            ActorRole::SystemArchitect,
-                            "Orbit SA",
-                            ParticipantSource::Orbit,
-                        ),
-                        "ba_research" | "research" => (
-                            ActorRole::BusinessAnalyst,
-                            "BA Research",
-                            ParticipantSource::ChatGptWeb,
-                        ),
-                        other => {
-                            println!("Unknown role '{}'. Use 'sa' or 'ba_research'.", other);
-                            continue;
-                        }
-                    };
-
-                    match cli_state.inject(role, name, source, text).await {
-                        Ok(inj_id) => {
-                            println!("Injected message as '{}' (InjectionId: {})", name, inj_id);
-                        }
-                        Err(e) => {
-                            println!("Failed to inject message: {}", e);
+                match execute_interactive_command(&line, &cli_state, &host, port, &cli_shutdown)
+                    .await
+                {
+                    Ok(should_exit) => {
+                        if should_exit {
+                            break;
                         }
                     }
-                } else {
-                    println!("Unknown command '{}'. Type 'help' for commands.", trimmed);
+                    Err(e) => {
+                        eprintln!("Command error: {}", e);
+                    }
                 }
             }
         });

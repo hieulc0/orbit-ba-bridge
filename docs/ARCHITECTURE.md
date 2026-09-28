@@ -13,11 +13,11 @@ Extension Background Worker (Service Worker / Event Page)
        │
 Localhost WebSocket (`ws://127.0.0.1:48117` with auth handshake)
        │
-bridge-server (Rust CLI & runtime, connection loop, interactive injection CLI)
+bridge-server (Rust CLI & runtime, connection loop, interactive injection CLI, export commands)
        │
-bridge-core (Driver abstractions, session management, routing, multi-actor conversations, SQLite store)
+bridge-core (Driver abstractions, session management, routing, multi-actor conversations, SQLite store, export)
        │
-protocol (Wire types, versioned envelopes, domain identifiers, validation)
+protocol (Wire types, versioned envelopes, domain identifiers, error codes, validation)
        │
 Orbit ACP (Future milestone)
 ```
@@ -36,6 +36,42 @@ Orbit ACP (Future milestone)
 10. **Structured Artifact Promotion**: Casual chat stays local to the bridge; only validated engineering artifacts (`RequirementBrief`, `TechnicalProposal`, `Challenge`, `Resolution`, `AcceptanceDecision`) are promoted to Orbit.
 11. **Deduplication Invariant**: Every observed DOM turn is keyed by `external_message_id`. If already persisted for the active conversation, it is acknowledged as duplicate and discarded without altering monotonic sequence numbering.
 12. **Reload Recovery Invariant**: When a user refreshes ChatGPT (`F5` / `Cmd+R`), the extension reconnects, re-detects the conversation from the URL, and re-scans the DOM. The bridge matches the existing `external_conversation_ref` in SQLite and ignores historical messages already in store, resuming seamless operation for subsequent turns.
+13. **Conversation Switching**: Switching chats in ChatGPT (`/c/<id1>` -> `/c/<id2>`) switches the active bridge conversation. Historical messages in different chats are stored independently and never cross-pollinated or merged.
+14. **Unbound Conversation Binding**: Starting a chat at `chatgpt.com/` creates a temporary conversation without an external reference. When ChatGPT assigns `/c/<id>`, the temporary conversation is bound to the external ref, keeping all early turns in sequence without duplication.
+15. **Branch Mutation Safety**: External edits or message regeneration in the web UI trigger an `UNSUPPORTED_BRANCH_MUTATION` warning while leaving existing persisted rows immutable in the SQLite store.
+
+---
+
+## Standalone Conversation Runtime (Human ↔ ChatGPT)
+
+The bridge serves as a standalone daily conversation tool:
+
+- **Active Logical Actors**:
+  - `Human` (`role = Human`, `source = HumanBrowser`)
+  - `BA Product` (`role = BusinessAnalyst`, `source = ChatGptWeb`)
+- **Durable Local Persistence**:
+  - All messages, participants, and conversation metadata persist to SQLite using WAL mode and transactional sequence increments.
+  - Standard XDG storage paths:
+    - Data: `$XDG_DATA_HOME/orbit-ba-bridge/conversations.sqlite` (fallback `~/.local/share/orbit-ba-bridge/conversations.sqlite`)
+    - State & Tokens: `$XDG_STATE_HOME/orbit-ba-bridge/bridge_token` (fallback `~/.local/state/orbit-ba-bridge/bridge_token`)
+- **Multi-Tab Policy**:
+  - Strict single-tab attachment: only one active ChatGPT tab may communicate with the bridge server.
+  - If multiple ChatGPT tabs exist concurrently, the bridge reports `MULTIPLE_CHATGPT_TABS` error, refuses ambiguous routing, and waits for extraneous tabs to close.
+- **Export & Search**:
+  - Markdown export with clean participant headers, UTC timestamps, and horizontal rules.
+  - JSON export preserving conversation metadata, participants, and structured message history.
+  - Plain substring search over historical messages with snippet generation.
+
+---
+
+## Database Migrations & Versioning
+
+Database schema evolution is managed via SQLite `PRAGMA user_version`:
+
+- **Version 1 (Initial)**: Creates `conversations`, `participants`, `messages`, `context_projections`, and `artifacts` tables.
+- **Version 2 (Optimized Lookups)**:
+  - Adds index `idx_conversations_external_ref` for fast URL-based conversation matching.
+  - Adds composite index `idx_messages_conv_created` on `(conversation_id, created_at)` for accelerated timeline queries and export generation.
 
 ---
 
@@ -111,13 +147,13 @@ The browser extension is designed for seamless dual-browser execution across Chr
 
 ## Crate Responsibilities
 
-- **`crates/protocol`**: Stable wire format, `MessageEnvelope<T>`, `BrowserEvent`, `BrowserCommand`, `ClientHello`, `ServerHelloAck`, `InjectionId`, domain identifiers (`SessionId`, `CorrelationId`, `TaskId`, `ConversationId`, `ParticipantId`, `MessageId`, `ArtifactId`), and bounds validation.
+- **`crates/protocol`**: Stable wire format, `MessageEnvelope<T>`, `BrowserEvent`, `BrowserCommand`, `ClientHello`, `ServerHelloAck`, `BridgeErrorCode`, `InjectionId`, domain identifiers (`SessionId`, `CorrelationId`, `TaskId`, `ConversationId`, `ParticipantId`, `MessageId`, `ArtifactId`), and bounds validation.
 - **`crates/bridge-core`**:
   - `BrowserDriver` trait & `MockBrowserDriver`
   - `SessionManager` & `SessionState`
   - Multi-actor model: `ActorRole`, `Participant`, `ParticipantSource`
-  - Discussion model: `Conversation`, `ConversationMessage`, `MessageKind`
+  - Discussion model: `Conversation`, `ConversationMessage`, `MessageKind`, `ConversationSummary`, `MessageSearchResult`
   - `InjectionLedger`: Tracks pending injections, acceptance, materialization, and logical sender reconciliation
-  - Artifact reference definitions & context projection
-  - `ConversationStore` trait and `SqliteConversationStore` implementation
-- **`crates/bridge-server`**: Executable CLI, configuration, token management, `tokio-tungstenite` WebSocket listener on localhost, interactive CLI stdin prompt for manual injection, logging via `tracing`, and graceful shutdown handling.
+  - Markdown and JSON conversation exporters (`export_markdown`, `export_json`)
+  - `ConversationStore` trait and `SqliteConversationStore` implementation with SQLite migrations (`PRAGMA user_version`)
+- **`crates/bridge-server`**: Executable CLI, XDG path resolution, token management, `tokio-tungstenite` WebSocket listener on localhost, interactive CLI stdin prompt for manual injection and conversation inspection, logging via `tracing`, and graceful shutdown handling.

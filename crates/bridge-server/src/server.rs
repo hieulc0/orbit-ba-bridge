@@ -7,8 +7,8 @@ use bridge_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    BrowserCommand, BrowserEvent, CURRENT_PROTOCOL_VERSION, ClientHello, CorrelationId,
-    InjectionId, MessageEnvelope, ServerHelloAck, SessionId,
+    BridgeErrorCode, BrowserCommand, BrowserEvent, CURRENT_PROTOCOL_VERSION, ClientHello,
+    CorrelationId, InjectionId, MessageEnvelope, ServerHelloAck, SessionId,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ pub struct ServerState {
     pub ba_participant: Mutex<Option<Participant>>,
     pub cmd_broadcast_tx: broadcast::Sender<MessageEnvelope<BrowserCommand>>,
     pub active_session_state: Mutex<SessionState>,
+    pub attached_session_id: Mutex<Option<SessionId>>,
 }
 
 pub struct BridgeServer {
@@ -61,6 +62,7 @@ impl BridgeServer {
             ba_participant: Mutex::new(None),
             cmd_broadcast_tx,
             active_session_state: Mutex::new(SessionState::Disconnected),
+            attached_session_id: Mutex::new(None),
         });
 
         Ok(Self {
@@ -141,7 +143,7 @@ impl ServerState {
         source: ParticipantSource,
         content: &str,
     ) -> anyhow::Result<InjectionId> {
-        let conv = self.get_or_create_conversation(None).await?;
+        let conv = self.get_active_or_default_conversation().await?;
 
         // Ensure participant exists in database
         let mut existing_part = None;
@@ -203,34 +205,27 @@ impl ServerState {
         Ok(injection_id)
     }
 
-    /// Retrieve or lazily create the active conversation.
-    pub async fn get_or_create_conversation(
+    /// Create a new conversation and initialize its default Human and BA Product participants.
+    pub async fn create_conversation_for_ref(
         &self,
         external_ref: Option<String>,
     ) -> anyhow::Result<Conversation> {
-        let mut lock = self.active_conversation.lock().await;
-
-        if let Some(existing) = &*lock
-            && (external_ref.is_none()
-                || existing.external_conversation_ref == external_ref
-                || existing.external_conversation_ref.is_none())
-        {
-            return Ok(existing.clone());
-        }
+        let title = match &external_ref {
+            Some(r) => format!("ChatGPT Discussion ({})", r),
+            None => "ChatGPT Discussion".to_string(),
+        };
 
         let conv = self
             .store
             .create_conversation(NewConversation {
                 id: None,
-                title: Some("ChatGPT Discussion".into()),
+                title: Some(title),
                 orbit_workflow_id: None,
                 external_conversation_ref: external_ref,
             })
             .await?;
 
-        // Initialize default participants
-        let human = self
-            .store
+        self.store
             .add_participant(NewParticipant {
                 id: None,
                 conversation_id: conv.id.clone(),
@@ -240,8 +235,7 @@ impl ServerState {
             })
             .await?;
 
-        let ba = self
-            .store
+        self.store
             .add_participant(NewParticipant {
                 id: None,
                 conversation_id: conv.id.clone(),
@@ -251,11 +245,147 @@ impl ServerState {
             })
             .await?;
 
+        Ok(conv)
+    }
+
+    /// Sets the active conversation and refreshes cached participant references.
+    pub async fn set_active_conversation(&self, conv: Conversation) -> anyhow::Result<()> {
+        let mut human = None;
+        let mut ba = None;
+
+        let participants = self.store.list_participants(&conv.id).await?;
+        for p in participants {
+            if p.role == ActorRole::Human && human.is_none() {
+                human = Some(p);
+            } else if p.role == ActorRole::BusinessAnalyst && ba.is_none() {
+                ba = Some(p);
+            }
+        }
+
+        let human = match human {
+            Some(h) => h,
+            None => {
+                self.store
+                    .add_participant(NewParticipant {
+                        id: None,
+                        conversation_id: conv.id.clone(),
+                        role: ActorRole::Human,
+                        display_name: "Human".into(),
+                        source: ParticipantSource::HumanBrowser,
+                    })
+                    .await?
+            }
+        };
+
+        let ba = match ba {
+            Some(b) => b,
+            None => {
+                self.store
+                    .add_participant(NewParticipant {
+                        id: None,
+                        conversation_id: conv.id.clone(),
+                        role: ActorRole::BusinessAnalyst,
+                        display_name: "BA Product".into(),
+                        source: ParticipantSource::ChatGptWeb,
+                    })
+                    .await?
+            }
+        };
+
         *self.human_participant.lock().await = Some(human);
         *self.ba_participant.lock().await = Some(ba);
-        *lock = Some(conv.clone());
+        *self.active_conversation.lock().await = Some(conv);
 
+        Ok(())
+    }
+
+    /// Switch to existing conversation by external ref, bind active temporary conversation,
+    /// or create a new conversation for this ref.
+    pub async fn switch_or_bind_conversation(
+        &self,
+        external_ref: &str,
+    ) -> anyhow::Result<Conversation> {
+        let current_opt = self.active_conversation.lock().await.clone();
+
+        if let Some(active) = current_opt {
+            if active.external_conversation_ref.as_deref() == Some(external_ref) {
+                return Ok(active);
+            }
+
+            if active.external_conversation_ref.is_none() {
+                if let Some(existing) = self
+                    .store
+                    .find_conversation_by_external_ref(external_ref)
+                    .await?
+                {
+                    self.set_active_conversation(existing.clone()).await?;
+                    return Ok(existing);
+                } else {
+                    self.store
+                        .bind_external_ref(&active.id, external_ref)
+                        .await?;
+                    let mut updated = active.clone();
+                    updated.external_conversation_ref = Some(external_ref.to_string());
+                    *self.active_conversation.lock().await = Some(updated.clone());
+                    return Ok(updated);
+                }
+            }
+
+            // Switched to a different external ref
+            if let Some(existing) = self
+                .store
+                .find_conversation_by_external_ref(external_ref)
+                .await?
+            {
+                self.set_active_conversation(existing.clone()).await?;
+                return Ok(existing);
+            } else {
+                let new_conv = self
+                    .create_conversation_for_ref(Some(external_ref.to_string()))
+                    .await?;
+                self.set_active_conversation(new_conv.clone()).await?;
+                return Ok(new_conv);
+            }
+        }
+
+        // No active conversation currently set
+        if let Some(existing) = self
+            .store
+            .find_conversation_by_external_ref(external_ref)
+            .await?
+        {
+            self.set_active_conversation(existing.clone()).await?;
+            Ok(existing)
+        } else {
+            let new_conv = self
+                .create_conversation_for_ref(Some(external_ref.to_string()))
+                .await?;
+            self.set_active_conversation(new_conv.clone()).await?;
+            Ok(new_conv)
+        }
+    }
+
+    /// Ensure an unbound conversation exists as the active conversation.
+    pub async fn ensure_unbound_conversation(&self) -> anyhow::Result<Conversation> {
+        let lock = self.active_conversation.lock().await;
+        if let Some(existing) = &*lock {
+            return Ok(existing.clone());
+        }
+
+        drop(lock);
+        let conv = self.create_conversation_for_ref(None).await?;
+        self.set_active_conversation(conv.clone()).await?;
         Ok(conv)
+    }
+
+    /// Retrieve the current active conversation or initialize a default unbound one.
+    pub async fn get_active_or_default_conversation(&self) -> anyhow::Result<Conversation> {
+        let lock = self.active_conversation.lock().await;
+        if let Some(existing) = &*lock {
+            return Ok(existing.clone());
+        }
+        drop(lock);
+        self.ensure_unbound_conversation().await
     }
 
     pub async fn list_messages(&self) -> anyhow::Result<Vec<ConversationMessage>> {
@@ -285,7 +415,6 @@ async fn handle_connection(
     // -------------------------------------------------------------
     let handshake_ok = match ws_stream.next().await {
         Some(Ok(Message::Text(raw))) => {
-            // Attempt to parse as ClientHello or MessageEnvelope<BrowserEvent::Hello>
             let client_hello = if let Ok(h) = serde_json::from_str::<ClientHello>(&raw) {
                 Some(h)
             } else if let Ok(env) = MessageEnvelope::<BrowserEvent>::from_json_str(&raw) {
@@ -311,42 +440,67 @@ async fn handle_connection(
                 Some(h) => {
                     if h.protocol_version != CURRENT_PROTOCOL_VERSION.0 {
                         warn!(
+                            code = %BridgeErrorCode::ProtocolVersionMismatch,
                             version = h.protocol_version,
                             "Handshake rejected: unsupported protocol version"
                         );
                         let _ = ws_stream
                             .send(Message::Close(Some(CloseFrame {
                                 code: CloseCode::Policy,
-                                reason: "unsupported protocol version".into(),
+                                reason: BridgeErrorCode::ProtocolVersionMismatch.as_str().into(),
                             })))
                             .await;
                         false
                     } else if h.token != state.token {
-                        warn!("Handshake rejected: invalid bridge auth token");
+                        warn!(
+                            code = %BridgeErrorCode::AuthFailed,
+                            "Handshake rejected: invalid bridge auth token"
+                        );
                         let _ = ws_stream
                             .send(Message::Close(Some(CloseFrame {
                                 code: CloseCode::Policy,
-                                reason: "invalid bridge auth token".into(),
+                                reason: BridgeErrorCode::AuthFailed.as_str().into(),
                             })))
                             .await;
                         false
                     } else {
-                        info!(
-                            session_id = %session_id,
-                            ext_version = %h.extension_version,
-                            "browser_connected"
-                        );
-                        session.handle_event(&BrowserEvent::Connected);
-                        *state.active_session_state.lock().await = SessionState::Connected;
+                        // Enforce single attached browser session policy
+                        let mut attached = state.attached_session_id.lock().await;
+                        if let Some(existing_session) = &*attached {
+                            warn!(
+                                existing = %existing_session,
+                                incoming = %session_id,
+                                code = %BridgeErrorCode::MultipleChatgptTabs,
+                                "Multiple browser connections rejected: bridge requires a single attached session"
+                            );
+                            let _ = ws_stream
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: BridgeErrorCode::MultipleChatgptTabs.as_str().into(),
+                                })))
+                                .await;
+                            false
+                        } else {
+                            *attached = Some(session_id.clone());
+                            drop(attached);
 
-                        let ack = ServerHelloAck {
-                            protocol_version: CURRENT_PROTOCOL_VERSION.0,
-                            session_id: session_id.clone(),
-                            accepted: true,
-                        };
-                        let ack_json = serde_json::to_string(&ack)?;
-                        ws_stream.send(Message::Text(ack_json.into())).await?;
-                        true
+                            info!(
+                                session_id = %session_id,
+                                ext_version = %h.extension_version,
+                                "browser_connected"
+                            );
+                            session.handle_event(&BrowserEvent::Connected);
+                            *state.active_session_state.lock().await = SessionState::Connected;
+
+                            let ack = ServerHelloAck {
+                                protocol_version: CURRENT_PROTOCOL_VERSION.0,
+                                session_id: session_id.clone(),
+                                accepted: true,
+                            };
+                            let ack_json = serde_json::to_string(&ack)?;
+                            ws_stream.send(Message::Text(ack_json.into())).await?;
+                            true
+                        }
                     }
                 }
                 None => {
@@ -394,13 +548,18 @@ async fn handle_connection(
                                         *state.active_session_state.lock().await = SessionState::PageReady;
                                     }
                                     BrowserEvent::ConversationDetected { conversation_id, external_conversation_ref } => {
-                                        let conv = state.get_or_create_conversation(external_conversation_ref.clone()).await?;
+                                        let conv = if let Some(ref_str) = &external_conversation_ref {
+                                            state.switch_or_bind_conversation(ref_str).await?
+                                        } else {
+                                            state.ensure_unbound_conversation().await?
+                                        };
+
                                         *state.active_session_state.lock().await = SessionState::ConversationReady;
                                         info!(
                                             conversation_id = %conv.id,
                                             detected_id = ?conversation_id,
                                             external_ref = ?external_conversation_ref,
-                                            "conversation_detected"
+                                            "conversation_selected"
                                         );
                                     }
                                     BrowserEvent::InjectionAccepted { injection_id } => {
@@ -416,20 +575,28 @@ async fn handle_connection(
                                         );
                                     }
                                     BrowserEvent::UserMessageObserved { external_message_id, text } => {
-                                        let conv = state.get_or_create_conversation(None).await?;
+                                        let conv = state.get_active_or_default_conversation().await?;
+                                        let trimmed = text.trim();
 
-                                        // Store deduplication check
-                                        if let Some(_existing) = state.store.find_message_by_external_id(&conv.id, &external_message_id).await? {
-                                            debug!(external_id = %external_message_id, "duplicate_message_suppressed");
+                                        // Store deduplication & branch mutation check
+                                        if let Some(existing) = state.store.find_message_by_external_id(&conv.id, &external_message_id).await? {
+                                            if existing.content == trimmed {
+                                                debug!(external_id = %external_message_id, "duplicate_message_suppressed");
+                                            } else {
+                                                warn!(
+                                                    code = %BridgeErrorCode::UnsupportedBranchMutation,
+                                                    external_id = %external_message_id,
+                                                    "UNSUPPORTED_BRANCH_MUTATION: external user message content changed; preserving immutable original in store"
+                                                );
+                                            }
                                             continue;
                                         }
 
                                         // Resolve logical actor
-                                        let actor_id = if let Some(injected_actor) = state.ledger.resolve_user_message(Some(&external_message_id), None, &text) {
+                                        let actor_id = if let Some(injected_actor) = state.ledger.resolve_user_message(Some(&external_message_id), None, trimmed) {
                                             injected_actor
                                         } else {
-                                            let human = state.human_participant.lock().await.clone().unwrap();
-                                            human.id
+                                            state.human_participant.lock().await.as_ref().unwrap().id.clone()
                                         };
 
                                         let msg = state.store.append_message(NewMessage {
@@ -437,7 +604,7 @@ async fn handle_connection(
                                             conversation_id: conv.id.clone(),
                                             actor_id: actor_id.clone(),
                                             kind: MessageKind::Conversation,
-                                            content: text.clone(),
+                                            content: trimmed.to_string(),
                                             correlation_id: None,
                                             reply_to: None,
                                             external_message_id: Some(external_message_id.clone()),
@@ -450,7 +617,7 @@ async fn handle_connection(
                                         info!(
                                             actor_id = %actor_id,
                                             sequence = msg.sequence,
-                                            length = text.len(),
+                                            length = trimmed.len(),
                                             external_id = %external_message_id,
                                             "message_observed"
                                         );
@@ -461,22 +628,31 @@ async fn handle_connection(
                                             continue;
                                         }
 
-                                        let conv = state.get_or_create_conversation(None).await?;
+                                        let conv = state.get_active_or_default_conversation().await?;
+                                        let trimmed = text.trim();
 
-                                        // Store deduplication check
-                                        if let Some(_existing) = state.store.find_message_by_external_id(&conv.id, &external_message_id).await? {
-                                            debug!(external_id = %external_message_id, "duplicate_message_suppressed");
+                                        // Store deduplication & branch mutation check
+                                        if let Some(existing) = state.store.find_message_by_external_id(&conv.id, &external_message_id).await? {
+                                            if existing.content == trimmed {
+                                                debug!(external_id = %external_message_id, "duplicate_message_suppressed");
+                                            } else {
+                                                warn!(
+                                                    code = %BridgeErrorCode::UnsupportedBranchMutation,
+                                                    external_id = %external_message_id,
+                                                    "UNSUPPORTED_BRANCH_MUTATION: external assistant message content changed; preserving immutable original in store"
+                                                );
+                                            }
                                             continue;
                                         }
 
-                                        let ba = state.ba_participant.lock().await.clone().unwrap();
+                                        let ba = state.ba_participant.lock().await.as_ref().unwrap().clone();
 
                                         let msg = state.store.append_message(NewMessage {
                                             id: None,
                                             conversation_id: conv.id.clone(),
                                             actor_id: ba.id.clone(),
                                             kind: MessageKind::Response,
-                                            content: text.clone(),
+                                            content: trimmed.to_string(),
                                             correlation_id: None,
                                             reply_to: None,
                                             external_message_id: Some(external_message_id.clone()),
@@ -489,18 +665,27 @@ async fn handle_connection(
                                         info!(
                                             actor_id = %ba.id,
                                             sequence = msg.sequence,
-                                            length = text.len(),
+                                            length = trimmed.len(),
                                             external_id = %external_message_id,
                                             "assistant_response_observed"
                                         );
                                     }
                                     BrowserEvent::PageUnavailable { reason } => {
-                                        warn!(reason = %reason, "page_unavailable");
+                                        if reason.contains("MULTIPLE_CHATGPT_TABS") {
+                                            warn!(
+                                                code = %BridgeErrorCode::MultipleChatgptTabs,
+                                                reason = %reason,
+                                                "Multiple ChatGPT tabs detected: refusing ambiguous routing"
+                                            );
+                                        } else {
+                                            warn!(reason = %reason, "page_unavailable");
+                                        }
                                         *state.active_session_state.lock().await = SessionState::Unavailable;
                                     }
                                     BrowserEvent::Disconnected => {
                                         info!(session_id = %session_id, "browser_disconnected");
                                         session.reset_connection();
+                                        *state.attached_session_id.lock().await = None;
                                         *state.active_session_state.lock().await = SessionState::Disconnected;
                                         break;
                                     }
@@ -532,6 +717,7 @@ async fn handle_connection(
                     Some(Ok(Message::Close(_))) | None => {
                         info!(peer = %peer_addr, "browser_disconnected");
                         session.reset_connection();
+                        *state.attached_session_id.lock().await = None;
                         *state.active_session_state.lock().await = SessionState::Disconnected;
                         break;
                     }
@@ -561,6 +747,9 @@ async fn handle_connection(
             }
         }
     }
+
+    *state.attached_session_id.lock().await = None;
+    *state.active_session_state.lock().await = SessionState::Disconnected;
 
     Ok(())
 }

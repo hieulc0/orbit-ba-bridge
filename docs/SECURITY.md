@@ -16,9 +16,15 @@ Without an authentication handshake, an unauthorized local page or script could 
 1. **Token Generation & Storage**:
    - On startup, `bridge-server` resolves its bridge auth token.
    - If `--auth-token <TOKEN>` is provided via CLI, it is used directly.
-   - Otherwise, the server looks for `--token-file <PATH>` or `target/bridge_token`. If missing, it generates a high-entropy cryptographically random UUID token and saves it to the token file.
-   - For developer convenience, `bridge-server` automatically writes `{ "token": "<TOKEN>", "protocol_version": 1 }` into `extension/token.json`.
-2. **Handshake Sequence**:
+   - Otherwise, the server looks for `--token-file <PATH>` or `$XDG_STATE_HOME/orbit-ba-bridge/bridge_token` (fallback `~/.local/state/orbit-ba-bridge/bridge_token`). If missing, it generates a high-entropy cryptographically random UUID token and saves it to the token file with directory permissions.
+   - For developer convenience, `bridge-server` synchronizes `{ "token": "<TOKEN>", "protocol_version": 1 }` into `extension/token.json`.
+2. **Git Hygiene & Secret Exclusion**:
+   - `extension/token.json`, SQLite database files (`*.sqlite*`), exports (`*.export.md`, `*.export.json`), and local state are strictly `.gitignore`d and must never be tracked or committed to version control.
+   - The token must never be embedded in git commit histories.
+3. **Redaction & Operational Safety**:
+   - The `status` command and log messages strictly redact the authentication token (showing masked representation like `abcd...ef01` or presence only).
+   - Error messages and export artifacts never leak the authentication token.
+4. **Handshake Sequence**:
    - Upon opening the WebSocket connection, the browser extension immediately issues a `ClientHello` frame:
      ```json
      {
@@ -28,7 +34,7 @@ Without an authentication handshake, an unauthorized local page or script could 
      }
      ```
    - `bridge-server` validates the token against its active server token.
-   - If the token does not match, or if `protocol_version != CURRENT_PROTOCOL_VERSION` (1), the server terminates the connection immediately with WebSocket close code `1008` (`PolicyViolation`).
+   - If the token does not match, or if `protocol_version != CURRENT_PROTOCOL_VERSION` (1), the server terminates the connection immediately with WebSocket close code `1008` (`PolicyViolation`) and standard error code `AUTH_FAILED` or `PROTOCOL_VERSION_MISMATCH`.
    - If valid, the server replies with `ServerHelloAck`:
      ```json
      {
@@ -38,6 +44,12 @@ Without an authentication handshake, an unauthorized local page or script could 
      }
      ```
    - Only after receiving `ServerHelloAck` does the extension begin streaming DOM events or processing bridge commands.
+
+## Single Tab Isolation
+
+- The bridge permits exactly one attached ChatGPT browser session at a time.
+- If multiple ChatGPT tabs or connections attempt to attach simultaneously, ambiguous routing is refused (`MULTIPLE_CHATGPT_TABS`).
+- This prevents race conditions, crossed discussion contexts, or accidental multi-tab injection.
 
 ## Browser Security Boundary
 
@@ -51,8 +63,3 @@ Without an authentication handshake, an unauthorized local page or script could 
 - Message text length is bounded (`MAX_MESSAGE_TEXT_LENGTH = 128 KiB`).
 - Total payload size is bounded (`MAX_PAYLOAD_BYTES = 256 KiB`).
 - Memory used for deduplication history is bounded to avoid memory exhaustion via unbounded sets.
-
-## Operational Logging
-
-- Log structural events (connection state, IDs, payload sizes) rather than raw prompt/response contents by default.
-- Never log authorization headers, cookies, or secrets.

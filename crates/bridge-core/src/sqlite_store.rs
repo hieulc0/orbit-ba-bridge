@@ -1,7 +1,7 @@
 //! SQLite implementation of `ConversationStore`.
 
-use crate::conversation::{Conversation, ConversationStatus, NewConversation};
-use crate::message::{ConversationMessage, MessageKind, NewMessage};
+use crate::conversation::{Conversation, ConversationStatus, ConversationSummary, NewConversation};
+use crate::message::{ConversationMessage, MessageKind, MessageSearchResult, NewMessage};
 use crate::participant::{ActorRole, NewParticipant, Participant, ParticipantSource};
 use crate::store::ConversationStore;
 use async_trait::async_trait;
@@ -32,71 +32,94 @@ impl SqliteConversationStore {
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-
-             CREATE TABLE IF NOT EXISTS conversations (
-                 id TEXT PRIMARY KEY,
-                 title TEXT,
-                 status TEXT NOT NULL,
-                 orbit_workflow_id TEXT,
-                 external_conversation_ref TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS participants (
-                 id TEXT PRIMARY KEY,
-                 conversation_id TEXT NOT NULL,
-                 role TEXT NOT NULL,
-                 display_name TEXT NOT NULL,
-                 source TEXT NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-             );
-
-             CREATE TABLE IF NOT EXISTS messages (
-                 id TEXT PRIMARY KEY,
-                 conversation_id TEXT NOT NULL,
-                 sequence INTEGER NOT NULL,
-                 actor_id TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 content TEXT NOT NULL,
-                 correlation_id TEXT,
-                 reply_to TEXT,
-                 external_message_id TEXT,
-                 orbit_workflow_id TEXT,
-                 orbit_role_execution_id TEXT,
-                 created_at INTEGER NOT NULL,
-                 UNIQUE (conversation_id, sequence),
-                 FOREIGN KEY (conversation_id) REFERENCES conversations(id),
-                 FOREIGN KEY (actor_id) REFERENCES participants(id)
-             );
-
-             CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages (conversation_id, sequence);
-             CREATE INDEX IF NOT EXISTS idx_messages_external ON messages (conversation_id, external_message_id);
-
-             CREATE TABLE IF NOT EXISTS external_message_links (
-                 message_id TEXT NOT NULL,
-                 external_id TEXT NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 PRIMARY KEY (message_id, external_id),
-                 FOREIGN KEY (message_id) REFERENCES messages(id)
-             );
-
-             CREATE TABLE IF NOT EXISTS artifact_refs (
-                 id TEXT PRIMARY KEY,
-                 conversation_id TEXT NOT NULL,
-                 artifact_type TEXT NOT NULL,
-                 digest TEXT,
-                 orbit_artifact_id TEXT,
-                 created_at INTEGER NOT NULL,
-                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-             );",
+             PRAGMA journal_mode = WAL;",
         )?;
+
+        let current_version: i64 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+        if current_version < 1 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS conversations (
+                     id TEXT PRIMARY KEY,
+                     title TEXT,
+                     status TEXT NOT NULL,
+                     orbit_workflow_id TEXT,
+                     external_conversation_ref TEXT,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+
+                 CREATE TABLE IF NOT EXISTS participants (
+                     id TEXT PRIMARY KEY,
+                     conversation_id TEXT NOT NULL,
+                     role TEXT NOT NULL,
+                     display_name TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT PRIMARY KEY,
+                     conversation_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     actor_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     correlation_id TEXT,
+                     reply_to TEXT,
+                     external_message_id TEXT,
+                     orbit_workflow_id TEXT,
+                     orbit_role_execution_id TEXT,
+                     created_at INTEGER NOT NULL,
+                     UNIQUE (conversation_id, sequence),
+                     FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+                     FOREIGN KEY (actor_id) REFERENCES participants(id)
+                 );
+
+                 CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages (conversation_id, sequence);
+                 CREATE INDEX IF NOT EXISTS idx_messages_external ON messages (conversation_id, external_message_id);
+
+                 CREATE TABLE IF NOT EXISTS external_message_links (
+                     message_id TEXT NOT NULL,
+                     external_id TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     PRIMARY KEY (message_id, external_id),
+                     FOREIGN KEY (message_id) REFERENCES messages(id)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS artifact_refs (
+                     id TEXT PRIMARY KEY,
+                     conversation_id TEXT NOT NULL,
+                     artifact_type TEXT NOT NULL,
+                     digest TEXT,
+                     orbit_artifact_id TEXT,
+                     created_at INTEGER NOT NULL,
+                     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                 );
+                 PRAGMA user_version = 1;",
+            )?;
+        }
+
+        if current_version < 2 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_external_ref ON conversations (external_conversation_ref);
+                 CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages (conversation_id, created_at);
+                 PRAGMA user_version = 2;",
+            )?;
+        }
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Returns the current schema version of the SQLite database.
+    pub fn schema_version(&self) -> anyhow::Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        Ok(version as u32)
     }
 }
 
@@ -110,7 +133,6 @@ impl ConversationStore for SqliteConversationStore {
         let id = input.id.unwrap_or_else(ConversationId::generate);
         let now = Utc::now();
         let now_ts = now.timestamp();
-        let status = ConversationStatus::Active;
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -119,7 +141,7 @@ impl ConversationStore for SqliteConversationStore {
             params![
                 id.as_str(),
                 input.title,
-                status.as_str(),
+                ConversationStatus::Active.as_str(),
                 input.orbit_workflow_id,
                 input.external_conversation_ref,
                 now_ts,
@@ -130,7 +152,7 @@ impl ConversationStore for SqliteConversationStore {
         Ok(Conversation {
             id,
             title: input.title,
-            status,
+            status: ConversationStatus::Active,
             created_at: now,
             updated_at: now,
             orbit_workflow_id: input.orbit_workflow_id,
@@ -171,6 +193,105 @@ impl ConversationStore for SqliteConversationStore {
             .optional()?;
 
         Ok(conv)
+    }
+
+    async fn find_conversation_by_external_ref(
+        &self,
+        external_ref: &str,
+    ) -> anyhow::Result<Option<Conversation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, orbit_workflow_id, external_conversation_ref, created_at, updated_at
+             FROM conversations
+             WHERE external_conversation_ref = ?1",
+        )?;
+
+        let conv = stmt
+            .query_row(params![external_ref], |row| {
+                let id_str: String = row.get(0)?;
+                let title: Option<String> = row.get(1)?;
+                let status_str: String = row.get(2)?;
+                let orbit_workflow_id: Option<String> = row.get(3)?;
+                let external_conversation_ref: Option<String> = row.get(4)?;
+                let created_ts: i64 = row.get(5)?;
+                let updated_ts: i64 = row.get(6)?;
+
+                let status = ConversationStatus::from_str_name(&status_str)
+                    .unwrap_or(ConversationStatus::Active);
+
+                Ok(Conversation {
+                    id: ConversationId::new(id_str).unwrap(),
+                    title,
+                    status,
+                    created_at: dt_from_timestamp(created_ts),
+                    updated_at: dt_from_timestamp(updated_ts),
+                    orbit_workflow_id,
+                    external_conversation_ref,
+                })
+            })
+            .optional()?;
+
+        Ok(conv)
+    }
+
+    async fn bind_external_ref(
+        &self,
+        id: &ConversationId,
+        external_ref: &str,
+    ) -> anyhow::Result<()> {
+        let now_ts = Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET external_conversation_ref = ?1, updated_at = ?2 WHERE id = ?3",
+            params![external_ref, now_ts, id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    async fn list_conversations(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ConversationSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.title, c.status, c.external_conversation_ref, c.created_at, c.updated_at,
+                    COUNT(m.id) as message_count
+             FROM conversations c
+             LEFT JOIN messages m ON c.id = m.conversation_id
+             GROUP BY c.id
+             ORDER BY c.updated_at DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+
+        let iter = stmt.query_map(params![limit as i64, offset as i64], |row| {
+            let id_str: String = row.get(0)?;
+            let title: Option<String> = row.get(1)?;
+            let status_str: String = row.get(2)?;
+            let external_ref: Option<String> = row.get(3)?;
+            let created_ts: i64 = row.get(4)?;
+            let updated_ts: i64 = row.get(5)?;
+            let count_i64: i64 = row.get(6)?;
+
+            let status = ConversationStatus::from_str_name(&status_str)
+                .unwrap_or(ConversationStatus::Active);
+
+            Ok(ConversationSummary {
+                id: ConversationId::new(id_str).unwrap(),
+                title,
+                status,
+                external_conversation_ref: external_ref,
+                message_count: count_i64 as u64,
+                created_at: dt_from_timestamp(created_ts),
+                updated_at: dt_from_timestamp(updated_ts),
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in iter {
+            list.push(item?);
+        }
+        Ok(list)
     }
 
     async fn update_conversation_status(
@@ -223,7 +344,7 @@ impl ConversationStore for SqliteConversationStore {
              FROM participants WHERE id = ?1",
         )?;
 
-        let part = stmt
+        let p = stmt
             .query_row(params![id.as_str()], |row| {
                 let id_str: String = row.get(0)?;
                 let conv_str: String = row.get(1)?;
@@ -247,7 +368,7 @@ impl ConversationStore for SqliteConversationStore {
             })
             .optional()?;
 
-        Ok(part)
+        Ok(p)
     }
 
     async fn list_participants(
@@ -459,6 +580,21 @@ impl ConversationStore for SqliteConversationStore {
         Ok(list)
     }
 
+    async fn get_conversation_with_messages(
+        &self,
+        id: &ConversationId,
+    ) -> anyhow::Result<Option<(Conversation, Vec<Participant>, Vec<ConversationMessage>)>> {
+        let conv_opt = self.get_conversation(id).await?;
+        match conv_opt {
+            Some(conv) => {
+                let participants = self.list_participants(id).await?;
+                let messages = self.load_messages(id, None, 10_000).await?;
+                Ok(Some((conv, participants, messages)))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn link_external_message(
         &self,
         message_id: &MessageId,
@@ -473,8 +609,7 @@ impl ConversationStore for SqliteConversationStore {
         )?;
 
         conn.execute(
-            "INSERT OR IGNORE INTO external_message_links (message_id, external_id, created_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO external_message_links (message_id, external_id, created_at)\n             VALUES (?1, ?2, ?3)",
             params![message_id.as_str(), external_id, now_ts],
         )?;
 
@@ -531,5 +666,60 @@ impl ConversationStore for SqliteConversationStore {
             .optional()?;
 
         Ok(msg)
+    }
+
+    async fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageSearchResult>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", query);
+        let mut stmt = conn.prepare(
+            "SELECT m.conversation_id, m.id, m.sequence, m.actor_id, p.display_name, m.kind, m.content, m.created_at
+             FROM messages m
+             JOIN participants p ON m.actor_id = p.id
+             WHERE m.content LIKE ?1
+             ORDER BY m.created_at DESC
+             LIMIT ?2",
+        )?;
+
+        let iter = stmt.query_map(params![pattern, limit as i64], |row| {
+            let conv_id: String = row.get(0)?;
+            let msg_id: String = row.get(1)?;
+            let seq_i64: i64 = row.get(2)?;
+            let actor_id: String = row.get(3)?;
+            let display_name: String = row.get(4)?;
+            let kind_str: String = row.get(5)?;
+            let content: String = row.get(6)?;
+            let created_ts: i64 = row.get(7)?;
+
+            let kind = MessageKind::from_str_name(&kind_str).unwrap_or(MessageKind::Conversation);
+
+            let clean_content = content.replace(['\r', '\n'], " ");
+            let snippet = if clean_content.chars().count() > 100 {
+                let s: String = clean_content.chars().take(100).collect();
+                format!("{}...", s)
+            } else {
+                clean_content
+            };
+
+            Ok(MessageSearchResult {
+                conversation_id: ConversationId::new(conv_id).unwrap(),
+                message_id: MessageId::new(msg_id).unwrap(),
+                sequence: seq_i64 as u64,
+                actor_id: ParticipantId::new(actor_id).unwrap(),
+                actor_display_name: display_name,
+                kind,
+                content_snippet: snippet,
+                created_at: dt_from_timestamp(created_ts),
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in iter {
+            list.push(item?);
+        }
+        Ok(list)
     }
 }

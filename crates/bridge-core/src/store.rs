@@ -3,8 +3,8 @@
 //! Provides a narrow asynchronous interface for conversation persistence, decoupling
 //! storage implementation details from domain logic.
 
-use crate::conversation::{Conversation, ConversationStatus, NewConversation};
-use crate::message::{ConversationMessage, NewMessage};
+use crate::conversation::{Conversation, ConversationStatus, ConversationSummary, NewConversation};
+use crate::message::{ConversationMessage, MessageSearchResult, NewMessage};
 use crate::participant::{NewParticipant, Participant};
 use async_trait::async_trait;
 use protocol::{ConversationId, MessageId, ParticipantId};
@@ -19,6 +19,26 @@ pub trait ConversationStore: Send + Sync {
 
     /// Retrieve a conversation by its identifier.
     async fn get_conversation(&self, id: &ConversationId) -> anyhow::Result<Option<Conversation>>;
+
+    /// Find a conversation by its external ChatGPT reference (e.g. /c/<id>).
+    async fn find_conversation_by_external_ref(
+        &self,
+        external_ref: &str,
+    ) -> anyhow::Result<Option<Conversation>>;
+
+    /// Bind an existing conversation to an external conversation reference.
+    async fn bind_external_ref(
+        &self,
+        id: &ConversationId,
+        external_ref: &str,
+    ) -> anyhow::Result<()>;
+
+    /// List conversation summaries with message counts, ordered by most recently updated.
+    async fn list_conversations(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ConversationSummary>>;
 
     /// Update the operational status of a conversation.
     async fn update_conversation_status(
@@ -53,6 +73,12 @@ pub trait ConversationStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<ConversationMessage>>;
 
+    /// Retrieve full conversation with its participants and ordered messages.
+    async fn get_conversation_with_messages(
+        &self,
+        id: &ConversationId,
+    ) -> anyhow::Result<Option<(Conversation, Vec<Participant>, Vec<ConversationMessage>)>>;
+
     /// Link a stored message to an external browser DOM message identifier.
     async fn link_external_message(
         &self,
@@ -66,4 +92,11 @@ pub trait ConversationStore: Send + Sync {
         conversation_id: &ConversationId,
         external_id: &str,
     ) -> anyhow::Result<Option<ConversationMessage>>;
+
+    /// Search messages across conversations by substring matching.
+    async fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageSearchResult>>;
 }

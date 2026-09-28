@@ -47,6 +47,18 @@ pub struct Conversation {
     pub external_conversation_ref: Option<String>,
 }
 
+/// High-level summary of a conversation for listing and display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub id: ConversationId,
+    pub title: Option<String>,
+    pub status: ConversationStatus,
+    pub external_conversation_ref: Option<String>,
+    pub message_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Input payload to create a new conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NewConversation {

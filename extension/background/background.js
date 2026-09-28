@@ -85,6 +85,7 @@ async function connectWebSocket() {
             isAuthenticated = true;
             console.log(`[OrbitBridge] Handshake accepted by server (session: ${data.session_id})`);
             sendBridgeEvent("connected");
+            checkTabsCount();
           } else {
             console.error("[OrbitBridge] Server rejected handshake");
             ws.close();
@@ -137,6 +138,25 @@ function sendBridgeEvent(type, payload = undefined) {
   ws.send(JSON.stringify(envelope));
 }
 
+async function checkTabsCount() {
+  try {
+    const tabs = await browserAPI.tabs.query({
+      url: "https://chatgpt.com/*",
+    });
+
+    if (tabs && tabs.length > 1) {
+      console.warn("[OrbitBridge] Multiple ChatGPT tabs detected:", tabs.length);
+      sendBridgeEvent("page_unavailable", {
+        reason: "MULTIPLE_CHATGPT_TABS: Keep only one ChatGPT tab open for bridge operation",
+      });
+      return false;
+    }
+    return true;
+  } catch (_e) {
+    return true;
+  }
+}
+
 async function handleBridgeCommand(envelope) {
   try {
     const tabs = await browserAPI.tabs.query({
@@ -147,6 +167,14 @@ async function handleBridgeCommand(envelope) {
       console.warn("[OrbitBridge] No active ChatGPT tab found for command:", envelope);
       sendBridgeEvent("page_unavailable", {
         reason: "No active ChatGPT tab found",
+      });
+      return;
+    }
+
+    if (tabs.length > 1) {
+      console.warn("[OrbitBridge] Multiple ChatGPT tabs detected:", tabs.length);
+      sendBridgeEvent("page_unavailable", {
+        reason: "MULTIPLE_CHATGPT_TABS: Keep only one ChatGPT tab open for bridge operation",
       });
       return;
     }
@@ -170,12 +198,23 @@ async function handleBridgeCommand(envelope) {
 }
 
 // Forward messages from content scripts to WebSocket
-browserAPI.runtime.onMessage.addListener((message) => {
+browserAPI.runtime.onMessage.addListener(async (message) => {
   if (message && message.source === "content_script" && message.event) {
+    const singleTabOk = await checkTabsCount();
+    if (!singleTabOk) {
+      return;
+    }
+
     const { type, payload } = message.event;
     sendBridgeEvent(type, payload);
   }
 });
+
+// Tab listeners to react to multiple tabs created or removed
+if (browserAPI.tabs && browserAPI.tabs.onCreated) {
+  browserAPI.tabs.onCreated.addListener(checkTabsCount);
+  browserAPI.tabs.onRemoved.addListener(checkTabsCount);
+}
 
 // Start connection on load
 connectWebSocket();

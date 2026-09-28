@@ -56,6 +56,45 @@ pub enum ProtocolError {
     Serialization(String),
 }
 
+/// Standard operator and client error codes for bridge interactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeErrorCode {
+    BrowserNotConnected,
+    ChatgptPageNotReady,
+    MultipleChatgptTabs,
+    ConversationNotFound,
+    ExternalConversationChanged,
+    ComposerUnavailable,
+    DatabaseError,
+    AuthFailed,
+    ProtocolVersionMismatch,
+    UnsupportedBranchMutation,
+}
+
+impl BridgeErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BrowserNotConnected => "BROWSER_NOT_CONNECTED",
+            Self::ChatgptPageNotReady => "CHATGPT_PAGE_NOT_READY",
+            Self::MultipleChatgptTabs => "MULTIPLE_CHATGPT_TABS",
+            Self::ConversationNotFound => "CONVERSATION_NOT_FOUND",
+            Self::ExternalConversationChanged => "EXTERNAL_CONVERSATION_CHANGED",
+            Self::ComposerUnavailable => "COMPOSER_UNAVAILABLE",
+            Self::DatabaseError => "DATABASE_ERROR",
+            Self::AuthFailed => "AUTH_FAILED",
+            Self::ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
+            Self::UnsupportedBranchMutation => "UNSUPPORTED_BRANCH_MUTATION",
+        }
+    }
+}
+
+impl fmt::Display for BridgeErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Version of the bridge protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion(pub u16);

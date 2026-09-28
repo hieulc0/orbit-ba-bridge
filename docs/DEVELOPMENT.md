@@ -56,9 +56,9 @@ cargo run --bin bridge-server
 ```
 
 Upon starting, `bridge-server` will:
-1. Generate (or load) a bridge auth token at `target/bridge_token`.
+1. Generate (or load) a bridge auth token at `$XDG_STATE_HOME/orbit-ba-bridge/bridge_token` (fallback `~/.local/state/orbit-ba-bridge/bridge_token`).
 2. Automatically synchronize `{ "token": "...", "protocol_version": 1 }` into `extension/token.json`.
-3. Initialize the SQLite store at `target/bridge_data.sqlite`.
+3. Open or initialize the SQLite store at `$XDG_DATA_HOME/orbit-ba-bridge/conversations.sqlite` (fallback `~/.local/share/orbit-ba-bridge/conversations.sqlite`).
 4. Open an interactive command prompt on stdin.
 
 Available server CLI options:
@@ -71,6 +71,49 @@ cargo run --bin bridge-server -- --help
 #   --db-path <PATH>          Path to SQLite database (use ":memory:" for ephemeral)
 #   --non-interactive         Disable stdin command prompt
 ```
+
+---
+
+## CLI Conversation Commands
+
+Inspect, search, and export recorded conversations without starting the WebSocket server:
+
+```bash
+# List recorded conversations
+cargo run --bin bridge-server -- conversation list
+
+# Show conversation details and messages (truncated snippet)
+cargo run --bin bridge-server -- conversation show <CONVERSATION_ID>
+
+# Show conversation details with full message bodies
+cargo run --bin bridge-server -- conversation show <CONVERSATION_ID> --full
+
+# Search messages across all conversations
+cargo run --bin bridge-server -- conversation search "architecture"
+
+# Export conversation to Markdown
+cargo run --bin bridge-server -- conversation export <CONVERSATION_ID> --format markdown --output notes.md
+
+# Export conversation to JSON
+cargo run --bin bridge-server -- conversation export <CONVERSATION_ID> --format json --output history.json
+```
+
+---
+
+## Interactive Stdin Prompt Commands
+
+When running `bridge-server` interactively:
+
+- `status`: Show bridge listener, browser connection, attached tab, active conversation, and participants (strictly redacting secrets).
+- `conversation list` (or `conv list`): List recorded conversations.
+- `conversation show <id> [--full]` (or `conv show <id> [--full]`): Inspect conversation turns.
+- `messages`: Shorthand to inspect turns in the currently active conversation.
+- `conversation export <id> --format <markdown|json> [--output <path>]`: Export conversation.
+- `conversation search <query>` (or `conv search <query>`): Search messages.
+- `inject sa <message>`: Inject turn as Orbit SA.
+- `inject ba_research <message>`: Inject turn as BA Research.
+- `help`: Print available commands.
+- `quit` | `exit`: Gracefully stop the server.
 
 ---
 
@@ -87,11 +130,11 @@ You will see:
 ```text
 ==============================================================
 orbit-ba-bridge server
-Listening on: ws://127.0.0.1:48117
-Local bridge token: <UUID>
-SQLite store: target/bridge_data.sqlite
-Extension token synced: extension/token.json
-Type 'help' for interactive injection commands
+Listening on:           ws://127.0.0.1:48117
+SQLite store:           ~/.local/share/orbit-ba-bridge/conversations.sqlite
+Token status:           loaded (a1b2...c3d4)
+Extension token sync:   extension/token.json
+Interactive prompt:     Type 'help' for commands, 'quit' to stop
 ==============================================================
 ```
 
@@ -109,7 +152,7 @@ Type 'help' for interactive injection commands
 3. Switch back to your server terminal. You should see:
    - `browser_connected { session_id: "browser-...", ext_version: "0.1.0" }`
    - `page_ready { url: "https://chatgpt.com/c/..." }`
-   - `conversation_detected { conversation_id: "...", external_ref: "..." }`
+   - `conversation_selected { conversation_id: "...", external_ref: "..." }`
 
 ### Step 4: Manual Human Message Test
 1. In the ChatGPT browser tab, type:
@@ -141,26 +184,19 @@ Type 'help' for interactive injection commands
 2. The extension reconnects to `ws://127.0.0.1:48117` and re-scans historical DOM turns.
 3. In your server terminal:
    - `browser_connected`
-   - `conversation_detected`
+   - `conversation_selected`
    - Historical turns are checked against SQLite and logged as `duplicate_message_suppressed`.
    - **No duplicate rows are created** in SQLite.
 4. Send another message in ChatGPT:
    `"Proceed with next steps."`
 5. Observe that the new message is assigned monotonic sequence 5!
 
-### Step 7: Inspect Persisted Discussion
+### Step 7: Inspect Persisted Discussion & Export
 In the server terminal, type:
 ```text
+status
 messages
+conversation export <ID> --format markdown --output discussion.md
 ```
-You will see the fully sequenced, actor-attributed conversation log:
-```text
---- Persisted Messages (5) ---
-[ 1] actor=human-... kind=Conversation | We are designing the system architecture.
-[ 2] actor=ba-prod-... kind=Response | I can help with that...
-[ 3] actor=orbit-sa-... kind=Request | [External participant: Orbit SA]...
-[ 4] actor=ba-prod-... kind=Response | Decoupling credential management...
-[ 5] actor=human-... kind=Conversation | Proceed with next steps.
--------------------------------
-```
+You will see the fully sequenced, actor-attributed conversation log and exported Markdown file.
 Type `quit` to cleanly exit the server.

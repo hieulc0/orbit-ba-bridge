@@ -1,12 +1,75 @@
 //! Configuration and CLI argument parsing for `bridge-server`.
 
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "bridge-server",
     about = "Localhost WebSocket bridge connecting ChatGPT browser sessions to Orbit"
 )]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
+    #[command(flatten)]
+    pub server_config: Config,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Commands {
+    /// Run the bridge server daemon (default action)
+    Run(Config),
+    /// Conversation inspection, export, and search operations
+    #[command(subcommand)]
+    Conversation(ConversationAction),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConversationAction {
+    /// List recorded conversations
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+    /// Show details and messages for a conversation
+    Show {
+        id: String,
+        #[arg(long, default_value_t = false)]
+        full: bool,
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+    /// Export a conversation to Markdown or JSON
+    Export {
+        id: String,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Markdown)]
+        format: ExportFormat,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+    /// Search messages across conversations
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Parser, Debug, Clone)]
 pub struct Config {
     /// Host interface to bind (defaults to 127.0.0.1; non-localhost is discouraged for security)
     #[arg(long, default_value = "127.0.0.1")]
@@ -28,7 +91,7 @@ pub struct Config {
     #[arg(long)]
     pub token_file: Option<String>,
 
-    /// Path to SQLite database file (defaults to target/bridge_data.sqlite; use ":memory:" for ephemeral)
+    /// Path to SQLite database file (defaults to XDG data dir; use ":memory:" for ephemeral)
     #[arg(long)]
     pub db_path: Option<String>,
 

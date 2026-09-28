@@ -9,7 +9,7 @@ Extension (Client)                           bridge-server
         │                                           │
         │─── ClientHello (token, versions) ────────>│
         │                                           │ [validates token & version]
-        │<── ServerHelloAck (session_id, ok) ───────│
+        │<─── ServerHelloAck (session_id, ok) ──────│
         │                                           │
 ```
 
@@ -17,23 +17,42 @@ Extension (Client)                           bridge-server
 
 **ClientHello**:
 ```json
-{
-  "protocol_version": 1,
-  "token": "3a7c...token...9f",
-  "extension_version": "0.1.0"
-}
-```
+{\n  \"protocol_version\": 1,\n  \"token\": \"3a7c...token...9f\",\n  \"extension_version\": \"0.1.0\"\n}\n```
 
 **ServerHelloAck**:
 ```json
-{
-  "protocol_version": 1,
-  "session_id": "browser-54123",
-  "accepted": true
-}
-```
+{\n  \"protocol_version\": 1,\n  \"session_id\": \"browser-54123\",\n  \"accepted\": true\n}\n```
 
-If the handshake token does not match or protocol version differs from `CURRENT_PROTOCOL_VERSION` (1), `bridge-server` closes the connection with code `1008` (`PolicyViolation`) and an explanatory reason frame.
+If the handshake token does not match or protocol version differs from `CURRENT_PROTOCOL_VERSION` (1), `bridge-server` closes the connection with code `1008` (`PolicyViolation`) and an explanatory `BridgeErrorCode` reason frame.
+
+---
+
+## Standardized Error Codes (`BridgeErrorCode`)
+
+The bridge defines standard error codes across transport, session, and storage layers:
+
+| Error Code | Layer | Description |
+|---|---|---|
+| `BROWSER_NOT_CONNECTED` | Transport | Extension has not connected or connection dropped |
+| `CHATGPT_PAGE_NOT_READY` | Browser | Content script not yet attached or DOM prompt area not found |
+| `MULTIPLE_CHATGPT_TABS` | Browser / Tab | More than one ChatGPT tab open; routing ambiguous |
+| `CONVERSATION_NOT_FOUND` | Store | Requested conversation ID does not exist |
+| `EXTERNAL_CONVERSATION_CHANGED` | Browser / Conv | URL changed to another conversation |
+| `COMPOSER_UNAVAILABLE` | Browser | Input textarea disabled, blocked, or missing |
+| `DATABASE_ERROR` | Store | SQLite error, schema corruption, or query failure |
+| `AUTH_FAILED` | Transport / Security | Invalid or missing bridge token |
+| `PROTOCOL_VERSION_MISMATCH` | Transport | Unsupported client/server protocol version |
+| `UNSUPPORTED_BRANCH_MUTATION` | Core / Store | Historical turn was edited or regenerated externally |
+
+---
+
+## Multi-Tab Isolation & Policy
+
+The bridge strictly enforces a single controlled ChatGPT tab per browser session:
+
+1. **Extension Detection**: The background service worker tracks tabs matching `https://chatgpt.com/*`. If `tabs.length > 1`, it immediately fires `page_unavailable` with reason `MULTIPLE_CHATGPT_TABS: Keep only one ChatGPT tab open for bridge operation` and suppresses further DOM observations.
+2. **Server Enforcement**: If a second WebSocket connection is attempted while an existing browser session is attached, `bridge-server` rejects the incoming connection with close code `1008` and reason `MULTIPLE_CHATGPT_TABS`.
+3. **Recovery**: When extra tabs are closed, the extension detects single-tab state and normal operations resume automatically.
 
 ---
 
@@ -42,18 +61,7 @@ If the handshake token does not match or protocol version differs from `CURRENT_
 All subsequent communication between the browser extension and `bridge-server` uses the versioned JSON envelope:
 
 ```json
-{
-  "version": 1,
-  "session_id": "browser-54123",
-  "correlation_id": "corr-1710000000-xyz",
-  "type": "assistant_message_observed",
-  "payload": {
-    "external_message_id": "turn-0-analysis",
-    "text": "Analysis of requirement brief.",
-    "is_final": true
-  }
-}
-```
+{\n  \"version\": 1,\n  \"session_id\": \"browser-54123\",\n  \"correlation_id\": \"corr-1710000000-xyz\",\n  \"type\": \"assistant_message_observed\",\n  \"payload\": {\n    \"external_message_id\": \"turn-0-analysis\",\n    \"text\": \"Analysis of requirement brief.\",\n    \"is_final\": true\n  }\n}\n```
 
 ### Envelope Fields
 
@@ -105,15 +113,15 @@ bridge-server              Extension Background           Extension Content Scri
       │─── InjectMessage(I42) ──────>│                               │                          │
       │                              │─── tabs.sendMessage() ───────>│                          │
       │                              │                               │─── InjectionAccepted ────> [composer insert]
-      │<── InjectionAccepted(I42) ───│<── runtime.sendMessage() ─────│                          │
+      │<─── InjectionAccepted(I42) ───│<─── runtime.sendMessage() ─────│                          │
       │                              │                               │─── click send button ───>│
       │                              │                               │                          │ [turn renders]
-      │                              │                               │<── DOM MutationObserver ─│
-      │                              │<── InjectionMaterialized ─────│                          │
-      │<── InjectionMaterialized ────│                               │                          │
+      │                              │                               │<─── DOM MutationObserver ─│
+      │                              │<─── InjectionMaterialized ─────│                          │
+      │<─── InjectionMaterialized ────│                               │                          │
       │    (I42 -> ext_id: M123)     │                               │                          │
-      │                              │<── UserMessageObserved ───────│                          │
-      │<── UserMessageObserved ──────│                               │                          │
+      │                              │<─── UserMessageObserved ───────│                          │
+      │<─── UserMessageObserved ──────│                               │                          │
       │    (ext_id: M123)            │                               │                          │
       │                              │                               │                          │
  [bridge links M123 to Orbit SA]     │                               │                          │

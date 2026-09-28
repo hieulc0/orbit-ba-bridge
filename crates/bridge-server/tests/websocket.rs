@@ -116,7 +116,7 @@ async fn test_reject_invalid_token() {
     match msg {
         Some(Ok(Message::Close(Some(frame)))) => {
             assert_eq!(frame.code, CloseCode::Policy);
-            assert_eq!(frame.reason, "invalid bridge auth token");
+            assert_eq!(frame.reason, protocol::BridgeErrorCode::AuthFailed.as_str());
         }
         other => panic!(
             "expected close frame with policy violation, got {:?}",
@@ -148,7 +148,10 @@ async fn test_reject_unsupported_protocol_version() {
     match msg {
         Some(Ok(Message::Close(Some(frame)))) => {
             assert_eq!(frame.code, CloseCode::Policy);
-            assert_eq!(frame.reason, "unsupported protocol version");
+            assert_eq!(
+                frame.reason,
+                protocol::BridgeErrorCode::ProtocolVersionMismatch.as_str()
+            );
         }
         other => panic!("expected close frame, got {:?}", other),
     }

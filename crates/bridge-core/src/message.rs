@@ -58,6 +58,19 @@ pub struct ConversationMessage {
     pub created_at: DateTime<Utc>,
 }
 
+/// Search match result across stored conversation messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSearchResult {
+    pub conversation_id: ConversationId,
+    pub message_id: MessageId,
+    pub sequence: u64,
+    pub actor_id: ParticipantId,
+    pub actor_display_name: String,
+    pub kind: MessageKind,
+    pub content_snippet: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Input payload to append a message to a conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMessage {
