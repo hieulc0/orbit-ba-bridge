@@ -1,16 +1,11 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements chronological turn extraction, action-bar completion detection,
- * debounced streaming assistant detection, duplicate suppression, and stable message IDs.
+ * Implements chronological turn extraction, local streaming detection via .result-streaming,
+ * duplicate suppression, and stable message IDs.
  */
 
 (function () {
-  function isVisible(el) {
-    if (!el) return false;
-    return Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  }
-
   function extractMessageText(el) {
     const contentEl =
       el.querySelector(".markdown") ||
@@ -52,7 +47,7 @@
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.activeStreaming = new Map(); // id -> { text, timer, unchangedCount }
+      this.activeStreaming = new Map(); // id -> { text, timer }
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
@@ -126,56 +121,8 @@
       }
     }
 
-    isGenerating() {
-      const stopBtn =
-        document.querySelector("button[data-testid='stop-button']") ||
-        document.querySelector("button[aria-label='Stop generating']") ||
-        document.querySelector("button[aria-label='Stop streaming']");
-
-      if (stopBtn && isVisible(stopBtn) && !stopBtn.disabled) {
-        return true;
-      }
-
-      const streamingEl = document.querySelector(".result-streaming");
-      if (streamingEl && isVisible(streamingEl)) {
-        return true;
-      }
-
-      return false;
-    }
-
     scanMessages() {
-      // 1. Primary: scan turn articles in chronological DOM order
-      const articles = document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-']"
-      );
-
-      if (articles.length > 0) {
-        articles.forEach((art, index) => {
-          const isAssistant = Boolean(
-            art.getAttribute("data-message-author-role") === "assistant" ||
-            art.querySelector("[data-message-author-role='assistant']") ||
-            art.querySelector(
-              ".markdown, [class*='prose'], button[aria-label*='Copy'], button[data-testid*='copy']"
-            )
-          );
-
-          const role = isAssistant ? "assistant" : "user";
-          const rawId = extractMessageId(art, role, index);
-          const text = extractMessageText(art);
-
-          if (!text) return;
-
-          if (role === "user") {
-            this.handleUserMessage(rawId, text);
-          } else {
-            this.handleAssistantMessage(rawId, text, art);
-          }
-        });
-        return;
-      }
-
-      // 2. Fallback: direct query for role containers
+      // 1. Primary: query authoritative author-role elements in DOM order
       const nodes = document.querySelectorAll(
         "[data-message-author-role='user'], [data-message-author-role='assistant']"
       );
@@ -191,6 +138,35 @@
             this.handleUserMessage(rawId, text);
           } else if (role === "assistant") {
             this.handleAssistantMessage(rawId, text, node);
+          }
+        });
+        return;
+      }
+
+      // 2. Fallback: query article turn containers
+      const articles = document.querySelectorAll(
+        "article, [data-testid^='conversation-turn-']"
+      );
+
+      if (articles.length > 0) {
+        articles.forEach((art, index) => {
+          let role = "user";
+          if (art.querySelector("[data-message-author-role='assistant']")) {
+            role = "assistant";
+          } else if (art.querySelector("[data-message-author-role='user']")) {
+            role = "user";
+          } else if (art.querySelector(".markdown, [class*='prose']")) {
+            role = "assistant";
+          }
+
+          const rawId = extractMessageId(art, role, index);
+          const text = extractMessageText(art);
+          if (!text) return;
+
+          if (role === "user") {
+            this.handleUserMessage(rawId, text);
+          } else {
+            this.handleAssistantMessage(rawId, text, art);
           }
         });
       }
@@ -237,67 +213,34 @@
         return;
       }
 
-      // Check if action bar is already rendered (Copy button, thumbs, etc.)
-      // When action bar is present, generation is 100% complete
-      const hasActionBar = Boolean(
-        el.querySelector(
-          "button[aria-label*='Copy'], button[data-testid*='copy'], button[aria-label*='Good response'], button[aria-label*='Bad response'], button[aria-label*='Read aloud']"
-        ) ||
-        el.closest("article")?.querySelector(
-          "button[aria-label*='Copy'], button[data-testid*='copy']"
-        )
-      );
-
-      if (hasActionBar) {
-        this.finalizeAssistantMessageWithText(messageId, text);
-        return;
-      }
-
       const isStreamingEl =
         el.classList.contains("result-streaming") ||
         Boolean(el.querySelector(".result-streaming"));
-      const globallyGenerating = this.isGenerating();
 
-      if (isStreamingEl || globallyGenerating) {
+      if (isStreamingEl) {
         if (this.activeStreaming.has(messageId)) {
           const item = this.activeStreaming.get(messageId);
           clearTimeout(item.timer);
-
-          if (item.text === text) {
-            item.unchangedCount = (item.unchangedCount || 0) + 1;
-            if (item.unchangedCount >= 3) {
-              this.activeStreaming.delete(messageId);
-              this.finalizeAssistantMessageWithText(messageId, text);
-              return;
-            }
-          } else {
-            item.text = text;
-            item.unchangedCount = 0;
-          }
-
+          item.text = text;
           item.timer = setTimeout(() => {
             this.finalizeAssistantMessage(messageId);
-          }, 800);
+          }, 600);
         } else {
           const timer = setTimeout(() => {
             this.finalizeAssistantMessage(messageId);
-          }, 800);
-          this.activeStreaming.set(messageId, { text, timer, unchangedCount: 0 });
+          }, 600);
+          this.activeStreaming.set(messageId, { text, timer });
         }
         return;
       }
 
+      // Generation complete: finalize immediately
       this.finalizeAssistantMessageWithText(messageId, text);
     }
 
     finalizeAssistantMessage(messageId) {
       const item = this.activeStreaming.get(messageId);
       if (!item) return;
-
-      if (this.isGenerating() && item.unchangedCount < 3) {
-        item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId), 600);
-        return;
-      }
 
       this.activeStreaming.delete(messageId);
       this.finalizeAssistantMessageWithText(messageId, item.text);
