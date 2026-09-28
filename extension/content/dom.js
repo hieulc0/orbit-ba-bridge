@@ -13,6 +13,7 @@
  *    - [data-chatgpt-search-unit-key], [data-content-search-unit-key]
  *    - [data-conversation-role] headings (ChatGPT said vs You said)
  *    - [data-markdown-text-style="assistant-message"]
+ * 4. Deduplication of nested DOM wrappers and echo suppression for both Human and Assistant messages.
  */
 
 (function () {
@@ -143,14 +144,20 @@
   }
 
   function findConversationTurns() {
-    // Strategy 1: Search unit key containers
+    // Strategy 1: Search unit key containers (filtering out nested descendants)
     const unitContainers = Array.from(
       document.querySelectorAll(
         "[data-chatgpt-search-unit-key], [data-content-search-unit-key]"
       )
     );
     if (unitContainers.length > 0) {
-      return unitContainers.map((el, i) => ({
+      const topLevelUnits = unitContainers.filter((el, idx) => {
+        return !unitContainers.some(
+          (other, oIdx) => oIdx !== idx && other.contains(el)
+        );
+      });
+
+      return topLevelUnits.map((el, i) => ({
         el,
         role: determineTurnRole(el, i),
         index: i,
@@ -226,12 +233,12 @@
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.seenFinalTexts = new Set(); // Suppress duplicate content emissions
+      this.seenUserTexts = new Set(); // Suppress duplicate user message emissions
+      this.seenFinalTexts = new Set(); // Suppress duplicate assistant emissions
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
       this.pendingInjection = null;
-      this.lastAssistantStreaming = null; // { text, timer }
     }
 
     setPendingInjection(injection) {
@@ -279,10 +286,6 @@
         clearInterval(this.pollInterval);
         this.pollInterval = null;
       }
-      if (this.lastAssistantStreaming?.timer) {
-        clearTimeout(this.lastAssistantStreaming.timer);
-      }
-      this.lastAssistantStreaming = null;
     }
 
     detectConversation() {
@@ -292,6 +295,7 @@
         console.log(`[OrbitBridge DOM] Conversation detected: ${convId}`);
         this.currentConversationId = convId;
         this.seenMessageIds.clear();
+        this.seenUserTexts.clear();
         this.seenFinalTexts.clear();
         this.onEvent({
           type: "conversation_detected",
@@ -335,11 +339,25 @@
         validTurns.push({ el, role, text, messageId, occ });
       });
 
+      // Collapse adjacent duplicate turn wrappers (e.g. nested outer/inner search unit elements)
+      const collapsedTurns = [];
+      validTurns.forEach((turn) => {
+        const last = collapsedTurns[collapsedTurns.length - 1];
+        if (last && last.role === turn.role && last.text === turn.text) {
+          // If this duplicate element has the native UUID, prefer it
+          if (turn.messageId && !turn.messageId.startsWith(convId || "conv")) {
+            collapsedTurns[collapsedTurns.length - 1] = turn;
+          }
+          return;
+        }
+        collapsedTurns.push(turn);
+      });
+
       const isGenerating = isChatGPTGenerating();
 
-      validTurns.forEach((turn, idx) => {
+      collapsedTurns.forEach((turn, idx) => {
         const { role, text, messageId } = turn;
-        const isLastTurn = idx === validTurns.length - 1;
+        const isLastTurn = idx === collapsedTurns.length - 1;
 
         if (role === "user") {
           this.handleUserMessage(messageId, text);
@@ -354,7 +372,15 @@
         return;
       }
 
+      // If we already captured a user message with this exact text in this thread, skip duplicate DOM wrapper
+      if (this.seenUserTexts.has(text)) {
+        this.seenMessageIds.add(messageId);
+        return;
+      }
+
       this.seenMessageIds.add(messageId);
+      this.seenUserTexts.add(text);
+
       console.log(
         `[OrbitBridge DOM] >>> Emitting user_message_observed (${messageId}):`,
         text.slice(0, 50)

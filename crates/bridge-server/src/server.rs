@@ -599,6 +599,16 @@ async fn handle_connection(
                                             state.human_participant.lock().await.as_ref().unwrap().id.clone()
                                         };
 
+                                        // Immediate duplicate content guard (same actor sending identical content consecutively)
+                                        if let Ok(Some((_, _, msgs))) = state.store.get_conversation_with_messages(&conv.id).await {
+                                            if let Some(last_msg) = msgs.last() {
+                                                if last_msg.actor_id == actor_id && last_msg.content == trimmed {
+                                                    debug!(external_id = %external_message_id, "immediate_duplicate_content_suppressed");
+                                                    continue;
+                                                }
+                                            }
+                                        }
+
                                         let msg = state.store.append_message(NewMessage {
                                             id: None,
                                             conversation_id: conv.id.clone(),
@@ -643,6 +653,16 @@ async fn handle_connection(
                                                 );
                                             }
                                             continue;
+                                        }
+
+                                        // Immediate duplicate content guard
+                                        if let Ok(Some((_, _, msgs))) = state.store.get_conversation_with_messages(&conv.id).await {
+                                            if let Some(last_msg) = msgs.last() {
+                                                if last_msg.content == trimmed {
+                                                    debug!(external_id = %external_message_id, "immediate_duplicate_content_suppressed");
+                                                    continue;
+                                                }
+                                            }
                                         }
 
                                         let ba = state.ba_participant.lock().await.as_ref().unwrap().clone();
