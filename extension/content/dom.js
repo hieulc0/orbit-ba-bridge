@@ -1,14 +1,30 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Targets ChatGPT's active DOM structure:
- * - Turn containers: [data-chatgpt-search-unit-key], [data-content-search-unit-key]
- * - Turn headings: [data-conversation-role="assistant" | "user"]
- * - Content blocks: [data-markdown-text-style="assistant-message"], [data-message-author-role]
- * - Native message IDs: [data-chatgpt-selection-message-id], [data-message-id]
+ * Implements:
+ * 1. Stable, deterministic message ID extraction:
+ *    - Native ChatGPT selection UUID: data-chatgpt-selection-message-id
+ *    - Search unit UUIDs: data-chatgpt-search-message-ids
+ *    - Deterministic content hash with occurrence index (never relies on shifting DOM array indices).
+ * 2. Active streaming detection (isChatGPTGenerating):
+ *    - Detects generation stop button: button[data-testid="stop-button"], button[aria-label*="Stop"]
+ *    - Suppresses partial assistant chunks while generating; only emits once generation stabilizes.
+ * 3. Accurate turn identification using ChatGPT's modern container and role tags:
+ *    - [data-chatgpt-search-unit-key], [data-content-search-unit-key]
+ *    - [data-conversation-role] headings (ChatGPT said vs You said)
+ *    - [data-markdown-text-style="assistant-message"]
  */
 
 (function () {
+  function hashString(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash << 5) - hash + str.charCodeAt(i);
+      hash |= 0;
+    }
+    return (hash >>> 0).toString(36);
+  }
+
   function cleanNodeText(el) {
     try {
       const clone = el.cloneNode(true);
@@ -46,6 +62,14 @@
       }
     }
     return cleanNodeText(el);
+  }
+
+  function isChatGPTGenerating() {
+    return Boolean(
+      document.querySelector(
+        "button[data-testid='stop-button'], button[aria-label*='Stop generating'], button[aria-label*='Stop'], .result-streaming, [class*='result-streaming']"
+      )
+    );
   }
 
   function determineTurnRole(turnEl, index) {
@@ -93,7 +117,8 @@
     return index % 2 === 0 ? "user" : "assistant";
   }
 
-  function extractTurnId(el, role, index, convId) {
+  function extractTurnId(el, role, text, occurrence, convId) {
+    // 1. Direct native UUID on element or children/ancestors
     const directId =
       el.getAttribute?.("data-chatgpt-selection-message-id") ||
       el.querySelector?.("[data-chatgpt-selection-message-id]")?.getAttribute("data-chatgpt-selection-message-id") ||
@@ -103,19 +128,22 @@
 
     if (directId) return directId;
 
-    return `${convId || "conv"}-${role}-${index}`;
-  }
+    // 2. Search message IDs attribute (e.g. data-chatgpt-search-message-ids="<UUID> <UUID>")
+    const searchMsgIds =
+      el.getAttribute?.("data-chatgpt-search-message-ids") ||
+      el.querySelector?.("[data-chatgpt-search-message-ids]")?.getAttribute("data-chatgpt-search-message-ids");
+    if (searchMsgIds) {
+      const firstUuid = searchMsgIds.trim().split(/\s+/)[0];
+      if (firstUuid && firstUuid.length >= 8) return firstUuid;
+    }
 
-  function isStreaming(el) {
-    if (!el) return false;
-    return (
-      el.classList?.contains("result-streaming") ||
-      Boolean(el.querySelector?.(".result-streaming"))
-    );
+    // 3. Completely deterministic content hash + occurrence index
+    const hash = hashString(text.trim());
+    return `${convId || "conv"}-${role}-${occurrence}-${hash}`;
   }
 
   function findConversationTurns() {
-    // Strategy 1: Search unit key containers (the primary modern ChatGPT turn wrapper)
+    // Strategy 1: Search unit key containers
     const unitContainers = Array.from(
       document.querySelectorAll(
         "[data-chatgpt-search-unit-key], [data-content-search-unit-key]"
@@ -144,7 +172,7 @@
       });
     }
 
-    // Strategy 3: Assistant markdown containers + User author-role / bubbles
+    // Strategy 3: Assistant markdown containers + User bubbles
     const assistantNodes = Array.from(
       document.querySelectorAll(
         "[data-markdown-text-style='assistant-message'], [class*='MarkdownRoot']"
@@ -198,11 +226,12 @@
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.activeStreaming = new Map();
+      this.seenFinalTexts = new Set(); // Suppress duplicate content emissions
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
       this.pendingInjection = null;
+      this.lastAssistantStreaming = null; // { text, timer }
     }
 
     setPendingInjection(injection) {
@@ -231,7 +260,7 @@
       this.pollInterval = setInterval(() => {
         this.detectConversation();
         this.scanMessages();
-      }, 1500);
+      }, 1000);
 
       this.onEvent({
         type: "page_ready",
@@ -250,10 +279,10 @@
         clearInterval(this.pollInterval);
         this.pollInterval = null;
       }
-      for (const item of this.activeStreaming.values()) {
-        if (item.timer) clearTimeout(item.timer);
+      if (this.lastAssistantStreaming?.timer) {
+        clearTimeout(this.lastAssistantStreaming.timer);
       }
-      this.activeStreaming.clear();
+      this.lastAssistantStreaming = null;
     }
 
     detectConversation() {
@@ -263,6 +292,7 @@
         console.log(`[OrbitBridge DOM] Conversation detected: ${convId}`);
         this.currentConversationId = convId;
         this.seenMessageIds.clear();
+        this.seenFinalTexts.clear();
         this.onEvent({
           type: "conversation_detected",
           payload: {
@@ -279,17 +309,15 @@
 
     scanMessages() {
       const convId = this.currentConversationId;
-      const turns = findConversationTurns();
+      const rawTurns = findConversationTurns();
+      if (rawTurns.length === 0) return;
 
-      if (turns.length > 0) {
-        console.log(
-          `[OrbitBridge DOM] scanMessages found ${turns.length} turns (conv: ${convId}):`,
-          turns.map((t) => `${t.role}[${t.index}]`)
-        );
-      }
+      // Extract valid text turns
+      const validTurns = [];
+      const occurrenceCount = new Map();
 
-      turns.forEach((turn) => {
-        const { el, role, index } = turn;
+      rawTurns.forEach((turn) => {
+        const { el, role } = turn;
         const text = extractTurnText(el, role);
         if (
           !text ||
@@ -299,12 +327,24 @@
           return;
         }
 
-        const messageId = extractTurnId(el, role, index, convId);
+        const occKey = `${role}:${text}`;
+        const occ = occurrenceCount.get(occKey) || 0;
+        occurrenceCount.set(occKey, occ + 1);
+
+        const messageId = extractTurnId(el, role, text, occ, convId);
+        validTurns.push({ el, role, text, messageId, occ });
+      });
+
+      const isGenerating = isChatGPTGenerating();
+
+      validTurns.forEach((turn, idx) => {
+        const { role, text, messageId } = turn;
+        const isLastTurn = idx === validTurns.length - 1;
 
         if (role === "user") {
           this.handleUserMessage(messageId, text);
         } else {
-          this.handleAssistantMessage(messageId, text, el);
+          this.handleAssistantMessage(messageId, text, isLastTurn, isGenerating);
         }
       });
     }
@@ -345,54 +385,25 @@
       });
     }
 
-    handleAssistantMessage(messageId, text, el) {
+    handleAssistantMessage(messageId, text, isLastTurn, isGenerating) {
       if (this.seenMessageIds.has(messageId)) {
         return;
       }
 
-      if (isStreaming(el)) {
-        if (this.activeStreaming.has(messageId)) {
-          const item = this.activeStreaming.get(messageId);
-          clearTimeout(item.timer);
-          item.text = text;
-          item.timer = setTimeout(() => {
-            this.finalizeAssistantMessage(messageId, el);
-          }, 600);
-        } else {
-          const timer = setTimeout(() => {
-            this.finalizeAssistantMessage(messageId, el);
-          }, 600);
-          this.activeStreaming.set(messageId, { text, timer, el });
-        }
+      // If this is the active last turn and ChatGPT is still generating, wait until complete
+      if (isLastTurn && isGenerating) {
         return;
       }
 
-      this.finalizeAssistantMessageWithText(messageId, text);
-    }
-
-    finalizeAssistantMessage(messageId, el) {
-      const item = this.activeStreaming.get(messageId);
-      if (!item) return;
-
-      if (isStreaming(el)) {
-        item.timer = setTimeout(
-          () => this.finalizeAssistantMessage(messageId, el),
-          500
-        );
-        return;
-      }
-
-      this.activeStreaming.delete(messageId);
-      const latestText = extractTurnText(el, "assistant") || item.text;
-      this.finalizeAssistantMessageWithText(messageId, latestText);
-    }
-
-    finalizeAssistantMessageWithText(messageId, text) {
-      if (this.seenMessageIds.has(messageId)) {
+      // If we already finalized an assistant message with this exact text in this thread, skip
+      if (this.seenFinalTexts.has(text)) {
+        this.seenMessageIds.add(messageId);
         return;
       }
 
       this.seenMessageIds.add(messageId);
+      this.seenFinalTexts.add(text);
+
       console.log(
         `[OrbitBridge DOM] >>> Emitting assistant_message_observed (${messageId}):`,
         text.slice(0, 50)
