@@ -1,7 +1,7 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements a robust 3-tier extraction engine (data-roles -> turn articles -> text/markdown blocks),
+ * Implements chronological turn extraction, action-bar completion detection,
  * debounced streaming assistant detection, duplicate suppression, and stable message IDs.
  */
 
@@ -145,74 +145,55 @@
     }
 
     scanMessages() {
-      // Tier 1: Authoritative attributes
-      let userNodes = Array.from(
-        document.querySelectorAll("[data-message-author-role='user']")
-      );
-      let assistantNodes = Array.from(
-        document.querySelectorAll("[data-message-author-role='assistant']")
+      // 1. Primary: scan turn articles in chronological DOM order
+      const articles = document.querySelectorAll(
+        "article, [data-testid^='conversation-turn-']"
       );
 
-      // Tier 2: Turn articles and conversation-turn containers
-      if (userNodes.length === 0 && assistantNodes.length === 0) {
-        const articles = document.querySelectorAll(
-          "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
-        );
-        articles.forEach((art) => {
-          if (
+      if (articles.length > 0) {
+        articles.forEach((art, index) => {
+          const isAssistant = Boolean(
+            art.getAttribute("data-message-author-role") === "assistant" ||
+            art.querySelector("[data-message-author-role='assistant']") ||
             art.querySelector(
               ".markdown, [class*='prose'], button[aria-label*='Copy'], button[data-testid*='copy']"
             )
-          ) {
-            assistantNodes.push(art);
-          } else if (
-            art.querySelector(".whitespace-pre-wrap") ||
-            (art.innerText && art.innerText.trim())
-          ) {
-            userNodes.push(art);
+          );
+
+          const role = isAssistant ? "assistant" : "user";
+          const rawId = extractMessageId(art, role, index);
+          const text = extractMessageText(art);
+
+          if (!text) return;
+
+          if (role === "user") {
+            this.handleUserMessage(rawId, text);
+          } else {
+            this.handleAssistantMessage(rawId, text, art);
+          }
+        });
+        return;
+      }
+
+      // 2. Fallback: direct query for role containers
+      const nodes = document.querySelectorAll(
+        "[data-message-author-role='user'], [data-message-author-role='assistant']"
+      );
+
+      if (nodes.length > 0) {
+        nodes.forEach((node, index) => {
+          const role = node.getAttribute("data-message-author-role");
+          const rawId = extractMessageId(node, role, index);
+          const text = extractMessageText(node);
+          if (!text) return;
+
+          if (role === "user") {
+            this.handleUserMessage(rawId, text);
+          } else if (role === "assistant") {
+            this.handleAssistantMessage(rawId, text, node);
           }
         });
       }
-
-      // Tier 3: Universal fallback by content class
-      if (userNodes.length === 0 && assistantNodes.length === 0) {
-        document.querySelectorAll(".markdown, [class*='prose']").forEach((el) => {
-          assistantNodes.push(el);
-        });
-        document.querySelectorAll(".whitespace-pre-wrap").forEach((el) => {
-          if (
-            !el.closest("form") &&
-            !el.closest("#prompt-textarea") &&
-            !el.isContentEditable
-          ) {
-            userNodes.push(el);
-          }
-        });
-      }
-
-      if (userNodes.length > 0 || assistantNodes.length > 0) {
-        console.log(
-          `[OrbitBridge DOM] Scan result: ${userNodes.length} user nodes, ${assistantNodes.length} assistant nodes`
-        );
-      }
-
-      // Process user messages
-      userNodes.forEach((node, index) => {
-        const rawId = extractMessageId(node, "user", index);
-        const text = extractMessageText(node);
-        if (text) {
-          this.handleUserMessage(rawId, text);
-        }
-      });
-
-      // Process assistant messages
-      assistantNodes.forEach((node, index) => {
-        const rawId = extractMessageId(node, "assistant", index);
-        const text = extractMessageText(node);
-        if (text) {
-          this.handleAssistantMessage(rawId, text, node);
-        }
-      });
     }
 
     handleUserMessage(messageId, text) {
@@ -253,6 +234,22 @@
 
     handleAssistantMessage(messageId, text, el) {
       if (this.seenMessageIds.has(messageId)) {
+        return;
+      }
+
+      // Check if action bar is already rendered (Copy button, thumbs, etc.)
+      // When action bar is present, generation is 100% complete
+      const hasActionBar = Boolean(
+        el.querySelector(
+          "button[aria-label*='Copy'], button[data-testid*='copy'], button[aria-label*='Good response'], button[aria-label*='Bad response'], button[aria-label*='Read aloud']"
+        ) ||
+        el.closest("article")?.querySelector(
+          "button[aria-label*='Copy'], button[data-testid*='copy']"
+        )
+      );
+
+      if (hasActionBar) {
+        this.finalizeAssistantMessageWithText(messageId, text);
         return;
       }
 
