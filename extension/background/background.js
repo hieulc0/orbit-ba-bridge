@@ -130,11 +130,17 @@ function scheduleReconnect() {
 
 function sendBridgeEvent(type, payload = undefined) {
   if (!ws || ws.readyState !== WebSocket.OPEN || !isAuthenticated) {
+    console.warn("[OrbitBridge] Cannot sendBridgeEvent: WebSocket not ready or not authenticated", {
+      type,
+      wsReady: ws ? ws.readyState : null,
+      isAuthenticated,
+    });
     return;
   }
 
   const correlationId = `corr-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   const envelope = createEnvelope(SESSION_ID, correlationId, type, payload);
+  console.log(`[OrbitBridge] Sending event '${type}' over WebSocket`, envelope);
   ws.send(JSON.stringify(envelope));
 }
 
@@ -200,12 +206,15 @@ async function handleBridgeCommand(envelope) {
 // Forward messages from content scripts to WebSocket
 browserAPI.runtime.onMessage.addListener(async (message) => {
   if (message && message.source === "content_script" && message.event) {
+    const { type, payload } = message.event;
+    console.log(`[OrbitBridge] Forwarding content script event '${type}' to server`, payload);
+
     const singleTabOk = await checkTabsCount();
     if (!singleTabOk) {
+      console.warn(`[OrbitBridge] Blocked event '${type}' due to multiple tabs`);
       return;
     }
 
-    const { type, payload } = message.event;
     sendBridgeEvent(type, payload);
   }
 });

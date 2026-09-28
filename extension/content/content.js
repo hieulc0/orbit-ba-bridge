@@ -8,6 +8,7 @@
   const composer = new ComposerController();
 
   const observer = new DomObserver((event) => {
+    console.log("[OrbitBridge Content] Sending event to background:", event.type, event.payload);
     browserAPI.runtime.sendMessage({
       source: "content_script",
       event,
