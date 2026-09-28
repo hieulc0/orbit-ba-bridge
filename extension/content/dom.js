@@ -1,24 +1,12 @@
 /**
  * DOM observer and message extraction for ChatGPT web interface.
  *
- * Implements chronological turn extraction, local streaming detection via .result-streaming,
- * duplicate suppression, and stable message IDs.
+ * Implements chronological message extraction, local streaming detection via .result-streaming,
+ * duplicate suppression, conversation-scoped message IDs, and robust fallback selectors.
  */
 
 (function () {
-  function extractMessageText(el) {
-    const contentEl =
-      el.querySelector(".markdown") ||
-      el.querySelector("[class*='prose']") ||
-      el.querySelector(".whitespace-pre-wrap") ||
-      el.querySelector("[class*='text-message']") ||
-      el.querySelector("div[dir='auto']");
-
-    if (contentEl) {
-      const text = contentEl.innerText.trim();
-      if (text) return text;
-    }
-
+  function cleanNodeText(el) {
     try {
       const clone = el.cloneNode(true);
       clone
@@ -27,27 +15,37 @@
       const cleaned = clone.innerText.trim();
       if (cleaned) return cleaned;
     } catch (_e) {}
-
     return el.innerText.trim();
   }
 
-  function extractMessageId(el, role, index) {
+  function extractMessageText(node, role) {
+    if (role === "assistant") {
+      const md = node.querySelector(".markdown, [class*='prose']");
+      if (md && md.innerText.trim()) return md.innerText.trim();
+    } else {
+      const userBubble = node.querySelector(
+        ".whitespace-pre-wrap, [class*='whitespace-pre-wrap'], div[dir='auto']"
+      );
+      if (userBubble && userBubble.innerText.trim()) return userBubble.innerText.trim();
+    }
+    return cleanNodeText(node);
+  }
+
+  function extractMessageId(node, role, index, convId) {
     const directId =
-      el.getAttribute("data-message-id") ||
-      el.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
-      el.closest("[data-message-id]")?.getAttribute("data-message-id") ||
-      el.getAttribute("data-testid") ||
-      el.closest("article")?.getAttribute("data-testid");
+      node.getAttribute("data-message-id") ||
+      node.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
+      node.closest("[data-message-id]")?.getAttribute("data-message-id");
 
     if (directId) return directId;
-    return `turn-${role}-${index}`;
+    return `${convId || "conv"}-${role}-${index}`;
   }
 
   class DomObserver {
     constructor(onEvent) {
       this.onEvent = onEvent;
       this.seenMessageIds = new Set();
-      this.activeStreaming = new Map(); // id -> { text, timer }
+      this.activeStreaming = new Map(); // id -> { text, timer, el }
       this.observer = null;
       this.pollInterval = null;
       this.currentConversationId = null;
@@ -122,64 +120,61 @@
     }
 
     scanMessages() {
-      // 1. Primary: query article turn containers in DOM order
-      const articles = document.querySelectorAll(
-        "article, [data-testid^='conversation-turn-'], main [class*='conversation-turn']"
+      const convId = this.currentConversationId;
+
+      // 1. Primary: query authoritative author-role elements in DOM order
+      let messageNodes = Array.from(
+        document.querySelectorAll("[data-message-author-role]")
       );
 
-      if (articles.length > 0) {
-        articles.forEach((art, index) => {
-          let role = null;
-
-          // Check author-role attribute
-          const authorRole =
-            art.getAttribute("data-message-author-role") ||
-            art.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
-
-          if (authorRole === "user") {
-            role = "user";
-          } else if (authorRole === "assistant") {
-            role = "assistant";
-          } else if (
-            art.querySelector(".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']")
-          ) {
-            role = "assistant";
-          } else if (
-            art.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
-          ) {
-            role = "user";
-          } else {
-            // Heuristic: even turns are user, odd turns are assistant
-            role = index % 2 === 0 ? "user" : "assistant";
-          }
-
-          const rawId = extractMessageId(art, role, index);
-          const text = extractMessageText(art);
-          if (!text) return;
-
-          if (role === "user") {
-            this.handleUserMessage(rawId, text);
-          } else {
-            this.handleAssistantMessage(rawId, text, art);
-          }
-        });
-        return;
+      // 2. Fallback: query article turn containers if data-message-author-role not present
+      if (messageNodes.length === 0) {
+        messageNodes = Array.from(
+          document.querySelectorAll("article, [data-testid^='conversation-turn-']")
+        );
       }
 
-      // 2. Fallback: direct query for user and assistant nodes
-      const userNodes = document.querySelectorAll("[data-message-author-role='user'], .whitespace-pre-wrap");
-      userNodes.forEach((node, index) => {
-        if (node.closest("form") || node.closest("#prompt-textarea") || node.isContentEditable) return;
-        const rawId = extractMessageId(node, "user", index);
-        const text = extractMessageText(node);
-        if (text) this.handleUserMessage(rawId, text);
-      });
+      if (messageNodes.length === 0) return;
 
-      const assistantNodes = document.querySelectorAll("[data-message-author-role='assistant'], .markdown, [class*='prose']");
-      assistantNodes.forEach((node, index) => {
-        const rawId = extractMessageId(node, "assistant", index);
-        const text = extractMessageText(node);
-        if (text) this.handleAssistantMessage(rawId, text, node);
+      messageNodes.forEach((node, index) => {
+        let role = null;
+        const authorRole =
+          node.getAttribute("data-message-author-role") ||
+          node.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
+
+        if (authorRole === "user") {
+          role = "user";
+        } else if (authorRole === "assistant") {
+          role = "assistant";
+        } else if (
+          node.querySelector(
+            ".markdown, [class*='prose'], button[aria-label*='Read aloud'], button[aria-label*='Regenerate'], button[aria-label*='Good response']"
+          )
+        ) {
+          role = "assistant";
+        } else if (
+          node.querySelector("button[aria-label*='Edit'], [data-testid*='edit']")
+        ) {
+          role = "user";
+        } else {
+          role = index % 2 === 0 ? "user" : "assistant";
+        }
+
+        const rawId = extractMessageId(node, role, index, convId);
+        const text = extractMessageText(node, role);
+        if (
+          !text ||
+          text === "Ready when you are." ||
+          text === "What can I help with today?"
+        ) {
+          return;
+        }
+
+        if (role === "user") {
+          this.handleUserMessage(rawId, text);
+        } else {
+          this.handleAssistantMessage(rawId, text, node);
+        }
       });
     }
 
@@ -234,13 +229,13 @@
           clearTimeout(item.timer);
           item.text = text;
           item.timer = setTimeout(() => {
-            this.finalizeAssistantMessage(messageId);
+            this.finalizeAssistantMessage(messageId, el);
           }, 600);
         } else {
           const timer = setTimeout(() => {
-            this.finalizeAssistantMessage(messageId);
+            this.finalizeAssistantMessage(messageId, el);
           }, 600);
-          this.activeStreaming.set(messageId, { text, timer });
+          this.activeStreaming.set(messageId, { text, timer, el });
         }
         return;
       }
@@ -249,12 +244,23 @@
       this.finalizeAssistantMessageWithText(messageId, text);
     }
 
-    finalizeAssistantMessage(messageId) {
+    finalizeAssistantMessage(messageId, el) {
       const item = this.activeStreaming.get(messageId);
       if (!item) return;
 
+      const stillStreaming =
+        el &&
+        (el.classList.contains("result-streaming") ||
+          Boolean(el.querySelector(".result-streaming")));
+
+      if (stillStreaming) {
+        item.timer = setTimeout(() => this.finalizeAssistantMessage(messageId, el), 500);
+        return;
+      }
+
       this.activeStreaming.delete(messageId);
-      this.finalizeAssistantMessageWithText(messageId, item.text);
+      const latestText = extractMessageText(el, "assistant") || item.text;
+      this.finalizeAssistantMessageWithText(messageId, latestText);
     }
 
     finalizeAssistantMessageWithText(messageId, text) {

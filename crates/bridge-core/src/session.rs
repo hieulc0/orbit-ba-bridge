@@ -82,6 +82,16 @@ impl SessionManager {
                 conversation_id,
                 external_conversation_ref,
             } => {
+                let is_new_conv = match (&self.conversation_id, conversation_id) {
+                    (Some(curr), Some(new_id)) => curr != new_id,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if is_new_conv {
+                    self.seen_messages.clear();
+                    self.message_order.clear();
+                }
+
                 if let Some(c_id) = conversation_id {
                     self.conversation_id = Some(c_id.clone());
                 }
